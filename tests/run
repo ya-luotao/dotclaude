@@ -13,6 +13,7 @@ PASS=0; FAIL=0; FAILED_NAMES=""
 
 sandbox() {
   SB="$(mktemp -d "${TMPDIR:-/tmp}/dotclaude-test.XXXXXX")"
+  trap 'rm -rf "$SB"' EXIT
   export HOME="$SB/home"
   export DOTCLAUDE_HOME="$HOME/.dotclaude"
   mkdir -p "$HOME/.claude" "$SB/bin"
@@ -35,7 +36,6 @@ run_dc() { # capture combined output and status
   set +e
   OUT="$("$DC" "$@" 2>&1)"
   STATUS=$?
-  set -e 2>/dev/null; set +e
 }
 
 fail_now() { echo "    ✗ $*"; exit 1; }

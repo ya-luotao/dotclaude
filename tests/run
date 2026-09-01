@@ -221,6 +221,21 @@ s7_share_projects_merges_and_links() {
   # cleanupPeriodDays unset -> keep suggestion
   assert_contains "dotclaude keep team"
 }
+s7_share_projects_failed_merge_leaves_profile() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/projects"
+  local p="$DOTCLAUDE_HOME/profiles/team/projects"
+  mkdir -p "$p"
+  echo ok > "$p/ok.jsonl"
+  echo locked > "$p/unreadable.jsonl"; chmod 000 "$p/unreadable.jsonl"
+  run_dc share team projects
+  chmod 644 "$p/unreadable.jsonl"   # restore so sandbox cleanup works
+  assert_status 1
+  assert_contains "nothing was moved"
+  [ ! -L "$p" ] || fail_now "must not symlink after failed merge"
+  assert_file "$p/ok.jsonl"
+  assert_no_file "$p.bak"
+}
 s7_share_projects_refuses_foreign_symlink() {
   mk_profile team
   mkdir -p "$SB/external-store"
@@ -628,6 +643,7 @@ t "S7 share links items, backs up files"       s7_share_links_and_backs_up
 t "S7 share refuses default"                   s7_share_refuses_default
 t "S7 bare share excludes projects"            s7_share_default_set_excludes_projects
 t "S7 share projects merges and links"         s7_share_projects_merges_and_links
+t "S7 failed merge leaves profile untouched"   s7_share_projects_failed_merge_leaves_profile
 t "S7 share projects refuses foreign symlink"  s7_share_projects_refuses_foreign_symlink
 t "S7 share projects refuses stale .bak"       s7_share_projects_refuses_stale_bak
 t "S7 unshare projects keeps shared jsonl"     s7_unshare_projects_keeps_shared_transcripts

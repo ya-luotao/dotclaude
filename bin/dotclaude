@@ -3,7 +3,7 @@
 # https://github.com/ya-luotao/dotclaude
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 DOTCLAUDE_HOME="${DOTCLAUDE_HOME:-$HOME/.dotclaude}"
 PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
 
@@ -34,7 +34,7 @@ unbind^[dir]^Remove a project binding
 share^<name> [items...]^Symlink shared config from ~/.claude into a profile
 unshare^<name> [items...]^Remove shared symlinks (restores .bak if present)
 doctor^^Check for common multi-account pitfalls
-usage^[name]^Show cached 5h/weekly rate-limit usage per profile
+usage^[name] [--timeline]^Show cached 5h/weekly rate-limit usage per profile
 du^^Disk usage per profile
 clean^<name> [--days N] [--force]^Delete old session transcripts (dry-run unless --force)
 keep^<name> [--days N]^Retain sessions ~forever (sets cleanupPeriodDays, default 999999)
@@ -167,8 +167,16 @@ refreshes while claude runs; there is no official CLI or API for these
 numbers, so this relies on an undocumented format and may break with Claude
 Code updates. The /usage command inside claude is the authoritative view.
 
-  dotclaude usage           # all profiles
-  dotclaude usage team      # one profile
+--timeline renders every profile's windows on one time axis, soonest reset
+first: FREE (100 − utilization, as of each profile's cache fetch), time
+until reset, and a bar proportional to the remaining time — one glance
+answers "which account has capacity now, and when does each window come
+back". A window whose reset already passed shows `due` (the cache predates
+the reset, so the window is likely fresh). Needs python3.
+
+  dotclaude usage               # all profiles
+  dotclaude usage team          # one profile
+  dotclaude usage --timeline    # all accounts on one reset-time axis
 EOF
 ;;
     du) cat <<'EOF'
@@ -711,9 +719,95 @@ usage_bar() { # percent -> [########------------]
   printf '[%s]' "$out"
 }
 
+# Waterfall view: every profile's windows on one time axis, soonest reset
+# first — answers "which account has capacity right now, and when does each
+# window come back". Needs python3 for ISO timestamp math.
+usage_timeline() {
+  command -v python3 >/dev/null 2>&1 || die "usage --timeline needs python3"
+  local name rows all=""
+  for name in $1; do
+    rows="$(usage_rows "$(config_json "$name")")" || true
+    [ -n "$rows" ] || continue
+    all="$all$(printf '%s\n' "$rows" | awk -F'\t' -v p="$name" '
+      $1=="fetched" {print p"\tfetched\t"$2}
+      $1!="fetched" {print p"\t"$1"\t"$2"\t"$3}')
+"
+  done
+  [ -n "$all" ] || { echo "No cached usage data in any profile (launch claude once per profile)."; return 0; }
+  # data goes via env: stdin already carries the program for `python3 -`
+  DOTCLAUDE_TL_ROWS="$all" python3 - <<'PY'
+import datetime, os, sys
+
+def human(td, floor="due"):
+    s = int(td.total_seconds())
+    if s <= 0:
+        return floor
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m = s // 60
+    if d: return "%dd%02dh" % (d, h)
+    if h: return "%dh%02dm" % (h, m)
+    return "%dm" % m
+
+now = datetime.datetime.now(datetime.timezone.utc)
+rows, fetched = [], {}
+for line in os.environ.get("DOTCLAUDE_TL_ROWS", "").splitlines():
+    parts = line.split("\t")
+    if len(parts) < 3:
+        continue
+    prof, label = parts[0], parts[1]
+    if label == "fetched":
+        try:
+            ms = int(parts[2])
+        except ValueError:
+            continue
+        if ms:
+            fetched[prof] = human(now - datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc), floor="0m")
+        continue
+    if len(parts) < 4 or not parts[3]:
+        continue
+    try:
+        pct = round(float(parts[2]))
+        dt = datetime.datetime.fromisoformat(parts[3])
+    except ValueError:
+        continue
+    rows.append((prof, label, pct, dt))
+
+if not rows:
+    print("No cached usage data in any profile (launch claude once per profile).")
+    sys.exit(0)
+
+rows.sort(key=lambda r: r[3])
+W = 34
+maxrem = max((dt - now).total_seconds() for _, _, _, dt in rows)
+axis = "now " + "-" * (W - 2) + "> " + human(rows[-1][3] - now, floor="due")
+print("%-10s %-17s %5s  %-9s %s" % ("PROFILE", "WINDOW", "FREE", "RESETS IN", axis))
+for prof, label, pct, dt in rows:
+    rem = (dt - now).total_seconds()
+    n = 0 if rem <= 0 or maxrem <= 0 else max(1, round(W * rem / maxrem))
+    note = "  (past reset — cache stale, window likely fresh)" if rem <= 0 else ""
+    print("%-10s %-17s %4d%%  %-9s %s%s" % (prof, label, max(0, 100 - pct), human(dt - now), "#" * n, note))
+if fetched:
+    print()
+    print("cache age: " + ", ".join("%s %s" % kv for kv in fetched.items())
+          + " — FREE is as of fetch; bars show time until reset")
+PY
+}
+
 cmd_usage() {
-  local names="${1:-}" name rows fetched_ms age_min now_s
+  local names="" name rows fetched_ms age_min now_s timeline=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --timeline) timeline=1 ;;
+      -*) die "unknown option: $arg" ;;
+      *) names="$arg" ;;
+    esac
+  done
   if [ -n "$names" ]; then require_profile "$names"; else names="$(all_profiles)"; fi
+  if [ "$timeline" -eq 1 ]; then
+    usage_timeline "$names"
+    return
+  fi
   now_s="$(date +%s)"
   for name in $names; do
     rows="$(usage_rows "$(config_json "$name")")" || return 1

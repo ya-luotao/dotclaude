@@ -461,6 +461,72 @@ s13_usage_all_profiles() {
   assert_contains "fresh"
   assert_contains "not live"
 }
+mk_usage_cache_future() { # like mk_usage_cache but resets_at in the future
+  local in2h in3d
+  in2h="$(python3 -c 'import datetime as d;print((d.datetime.now(d.timezone.utc)+d.timedelta(hours=2)).isoformat())')"
+  in3d="$(python3 -c 'import datetime as d;print((d.datetime.now(d.timezone.utc)+d.timedelta(days=3)).isoformat())')"
+  cat > "$DOTCLAUDE_HOME/profiles/$1/.claude.json" <<EOF
+{"cachedUsageUtilization":{"fetchedAtMs":$(( $(date +%s) * 1000 )),
+ "utilization":{
+   "five_hour":{"utilization":44,"resets_at":"$in2h"},
+   "seven_day":{"utilization":33,"resets_at":"$in3d"},
+   "limits":[
+     {"kind":"weekly_scoped","percent":60,"resets_at":"$in3d",
+      "scope":{"model":{"display_name":"Fable"}}}]}}}
+EOF
+}
+s13_timeline_combines_accounts() {
+  mk_profile team; mk_usage_cache_future team
+  mk_profile solo; mk_usage_cache_future solo
+  mk_profile fresh   # no cache -> silently skipped
+  run_dc usage --timeline
+  assert_status 0
+  assert_contains "PROFILE"
+  assert_contains "RESETS IN"
+  assert_contains "team"
+  assert_contains "solo"
+  assert_contains "5h session"
+  assert_contains "weekly (Fable)"
+  assert_contains "56%"   # FREE = 100 - 44
+  assert_contains "40%"   # FREE = 100 - 60
+  assert_contains "cache age:"
+  assert_not_contains "fresh "   # skipped profile contributes no row
+}
+s13_timeline_marks_past_reset_due() {
+  mk_profile team; mk_usage_cache team   # fixed 2026-09 dates; due once passed
+  run_dc usage --timeline
+  assert_status 0
+  assert_contains "5h session"
+}
+s13_timeline_needs_python3() {
+  mk_profile team; mk_usage_cache team
+  mkdir -p "$SB/nojson"
+  local f
+  for f in /usr/bin/*; do ln -s "$f" "$SB/nojson/$(basename "$f")" 2>/dev/null || true; done
+  rm -f "$SB/nojson/python3" "$SB/nojson/jq"
+  local oldpath="$PATH"
+  PATH="$SB/bin:$SB/nojson:/bin"
+  run_dc usage --timeline
+  PATH="$oldpath"
+  assert_status 1
+  assert_contains "python3"
+}
+s13_usage_rejects_unknown_option() { run_dc usage --bogus; assert_status 1; assert_contains "unknown option"; }
+s13_timeline_notice_when_no_cache_at_all() {
+  mk_profile fresh
+  echo '{}' > "$DOTCLAUDE_HOME/profiles/fresh/.claude.json"
+  run_dc usage --timeline
+  assert_status 0
+  assert_contains "No cached usage data"
+}
+s13_timeline_notice_when_no_windows() {
+  mk_profile team   # cache present but carries no window rows
+  printf '{"cachedUsageUtilization":{"fetchedAtMs":%s,"utilization":{}}}\n' "$(( $(date +%s) * 1000 ))" \
+    > "$DOTCLAUDE_HOME/profiles/team/.claude.json"
+  run_dc usage --timeline
+  assert_status 0
+  assert_contains "No cached usage data"
+}
 
 # ---------- S14: keep ----------
 
@@ -583,6 +649,12 @@ t "S13 usage shows 5h/weekly/scoped windows"   s13_usage_shows_windows
 t "S13 usage notice when no cache"             s13_usage_no_cache_notice
 t "S13 usage unknown profile errors"           s13_usage_unknown_profile_errors
 t "S13 usage covers all profiles"              s13_usage_all_profiles
+t "S13 timeline combines accounts"             s13_timeline_combines_accounts
+t "S13 timeline renders fixed-date cache"      s13_timeline_marks_past_reset_due
+t "S13 timeline needs python3"                 s13_timeline_needs_python3
+t "S13 usage rejects unknown option"           s13_usage_rejects_unknown_option
+t "S13 timeline notice when no cache"          s13_timeline_notice_when_no_cache_at_all
+t "S13 timeline notice when no windows"        s13_timeline_notice_when_no_windows
 t "S12 help lists every command"               s12_help_lists_all_dispatch_commands
 t "S12 every listed command has topic help"    s12_every_listed_command_has_topic_help
 t "S12 --help never executes the command"      s12_dashdash_help_never_executes

@@ -172,6 +172,15 @@ directly and get the default account unless they use `dotclaude run` or set
   a crash.
 - A profile without cached data gets a notice (exit 0); an unknown profile
   name is an error. Requires `jq` or `python3`.
+- `usage --timeline` (optionally with a profile name) renders all selected
+  profiles' windows on one time axis, sorted soonest reset first, each row
+  showing FREE (100 − utilization, as of that profile's cache fetch), time
+  until reset, and a bar proportional to remaining time, plus per-profile
+  cache age. A window whose reset already passed shows `due` and is marked
+  stale rather than guessed at. Profiles without cached data are skipped;
+  none at all yields a notice (exit 0). The timeline requires `python3`
+  (timestamp math) — without it, an error. Unknown options are errors. The
+  no-network / no-credentials guarantee above applies unchanged.
 
 ## S14. `keep <name> [--days N]` — session retention
 

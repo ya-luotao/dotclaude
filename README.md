@@ -137,6 +137,9 @@ dotclaude doctor                    # ANTHROPIC_API_KEY pollution, login status,
 dotclaude du                        # disk usage per profile (sessions get big)
 dotclaude clean team --days 60      # dry-run: what would be deleted
 dotclaude clean team --days 60 --force   # actually delete old transcripts
+dotclaude usage                     # cached 5h/weekly rate-limit windows per profile
+dotclaude usage --timeline          # all accounts on one reset-time axis:
+                                    # FREE %, time to reset, waterfall bars
 ```
 
 ## Verify isolation once (recommended)

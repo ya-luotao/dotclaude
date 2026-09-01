@@ -123,3 +123,17 @@ directly and get the default account unless they use `dotclaude run` or set
   notes/examples for that command. `<command> --help` (or `-h`, as the first
   argument) is equivalent and never executes the command.
 - `help <unknown>` is an error (exit non-zero).
+
+## S13. `usage [name]` — cached rate-limit windows
+
+- Shows, per profile: the 5-hour session window, the weekly window, and any
+  per-model weekly limits — utilization % with reset time — plus the cache age.
+- Data source is **Claude Code's own local cache**
+  (`cachedUsageUtilization` in the profile's `.claude.json`). `usage` makes
+  **no network requests and never touches credentials**. There is no official
+  CLI or API for subscription window utilization (verified 2026-09-01); the
+  cache format is undocumented and may change — parsing is best-effort: an
+  unrecognized format degrades to missing rows or the no-data notice, never
+  a crash.
+- A profile without cached data gets a notice (exit 0); an unknown profile
+  name is an error. Requires `jq` or `python3`.

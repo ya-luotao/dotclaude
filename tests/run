@@ -278,6 +278,51 @@ s9_doctor_flags_dangling_share() {
   assert_contains "dangling symlink"
 }
 
+# ---------- S13: usage ----------
+
+mk_usage_cache() { # writes cachedUsageUtilization into profile $1's .claude.json
+  cat > "$DOTCLAUDE_HOME/profiles/$1/.claude.json" <<EOF
+{"cachedUsageUtilization":{"fetchedAtMs":$(( $(date +%s) * 1000 )),
+ "utilization":{
+   "five_hour":{"utilization":44,"resets_at":"2026-09-01T12:50:00.204565+00:00"},
+   "seven_day":{"utilization":33,"resets_at":"2026-09-06T00:00:00.204583+00:00"},
+   "limits":[
+     {"kind":"session","percent":44},
+     {"kind":"weekly_scoped","percent":60,"resets_at":"2026-09-06T00:00:00+00:00",
+      "scope":{"model":{"display_name":"Fable"}}}]}}}
+EOF
+}
+s13_usage_shows_windows() {
+  mk_profile team; mk_usage_cache team
+  run_dc usage team
+  assert_status 0
+  assert_contains "5h session"
+  assert_contains "44%"
+  assert_contains "weekly (all)"
+  assert_contains "33%"
+  assert_contains "weekly (Fable)"
+  assert_contains "60%"
+  assert_contains "resets 2026-09-06 00:00 UTC"
+  assert_contains "fetched 0m ago"
+}
+s13_usage_no_cache_notice() {
+  mk_profile fresh
+  echo '{}' > "$DOTCLAUDE_HOME/profiles/fresh/.claude.json"
+  run_dc usage fresh
+  assert_status 0
+  assert_contains "no cached usage data"
+}
+s13_usage_unknown_profile_errors() { run_dc usage ghost; assert_status 1; }
+s13_usage_all_profiles() {
+  mk_profile team; mk_usage_cache team
+  mk_profile fresh
+  run_dc usage
+  assert_status 0
+  assert_contains "team"
+  assert_contains "fresh"
+  assert_contains "not live"
+}
+
 # ---------- S12: self-describing help ----------
 
 help_command_names() { # extract command names from `help` output's Commands block
@@ -347,6 +392,10 @@ t "S8 clean is dry-run by default"             s8_clean_dry_run_by_default
 t "S8 clean --force deletes only old jsonl"    s8_clean_force_deletes_only_old_jsonl
 t "S8 clean rejects non-numeric --days"        s8_clean_rejects_bad_days
 t "S8 clean unknown profile errors"            s8_clean_unknown_profile
+t "S13 usage shows 5h/weekly/scoped windows"   s13_usage_shows_windows
+t "S13 usage notice when no cache"             s13_usage_no_cache_notice
+t "S13 usage unknown profile errors"           s13_usage_unknown_profile_errors
+t "S13 usage covers all profiles"              s13_usage_all_profiles
 t "S12 help lists every command"               s12_help_lists_all_dispatch_commands
 t "S12 every listed command has topic help"    s12_every_listed_command_has_topic_help
 t "S12 --help never executes the command"      s12_dashdash_help_never_executes

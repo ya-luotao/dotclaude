@@ -3,7 +3,7 @@
 # https://github.com/ya-luotao/dotclaude
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 DOTCLAUDE_HOME="${DOTCLAUDE_HOME:-$HOME/.dotclaude}"
 PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
 
@@ -32,6 +32,7 @@ unbind^[dir]^Remove a project binding
 share^<name> [items...]^Symlink shared config from ~/.claude into a profile
 unshare^<name> [items...]^Remove shared symlinks (restores .bak if present)
 doctor^^Check for common multi-account pitfalls
+usage^[name]^Show cached 5h/weekly rate-limit usage per profile
 du^^Disk usage per profile
 clean^<name> [--days N] [--force]^Delete old session transcripts (dry-run unless --force)
 shellenv^[--alias NAME]^Print shell integration (claude() wrapper + optional alias)
@@ -138,6 +139,20 @@ Checks for the pitfalls that break multi-account setups: ANTHROPIC_API_KEY
 set (overrides /login for every profile), shell wrapper not installed,
 a global route pointing at a missing profile, dangling share symlinks,
 and per-profile login status.
+EOF
+;;
+    usage) cat <<'EOF'
+Shows the 5-hour session window, weekly window, and per-model weekly limits
+(utilization % + reset time) for each profile, plus how old the data is.
+
+Reads Claude Code's own local cache (cachedUsageUtilization in the profile's
+.claude.json) — no network requests, no credentials touched. The cache
+refreshes while claude runs; there is no official CLI or API for these
+numbers, so this relies on an undocumented format and may break with Claude
+Code updates. The /usage command inside claude is the authoritative view.
+
+  dotclaude usage           # all profiles
+  dotclaude usage team      # one profile
 EOF
 ;;
     du) cat <<'EOF'
@@ -516,6 +531,87 @@ cmd_doctor() {
   if [ "$problems" -eq 0 ]; then echo "No problems found."; else echo "$problems problem(s) found."; fi
 }
 
+# Emit normalized usage rows from a profile's .claude.json:
+# label<TAB>percent<TAB>resets_at, plus fetched<TAB><epoch_ms>.
+usage_rows() {
+  local cfg="$1"
+  [ -f "$cfg" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.cachedUsageUtilization // empty |
+      "fetched\t\(.fetchedAtMs // 0)",
+      (.utilization.five_hour  | select(. != null) | "5h session\t\(.utilization)\t\(.resets_at // "")"),
+      (.utilization.seven_day  | select(. != null) | "weekly (all)\t\(.utilization)\t\(.resets_at // "")"),
+      (.utilization.limits[]? | select(.kind == "weekly_scoped") |
+        "weekly (\(.scope.model.display_name // "scoped"))\t\(.percent)\t\(.resets_at // "")")' \
+      "$cfg" 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$cfg" <<'PY' 2>/dev/null
+import json, sys
+try:
+    cache = json.load(open(sys.argv[1])).get("cachedUsageUtilization") or {}
+except Exception:
+    sys.exit(0)
+if not cache:
+    sys.exit(0)
+u = cache.get("utilization") or {}
+print("fetched\t%s" % (cache.get("fetchedAtMs") or 0))
+for label, w in (("5h session", u.get("five_hour")), ("weekly (all)", u.get("seven_day"))):
+    if w:
+        print("%s\t%s\t%s" % (label, w.get("utilization"), w.get("resets_at") or ""))
+for lim in u.get("limits") or []:
+    if lim.get("kind") == "weekly_scoped":
+        model = ((lim.get("scope") or {}).get("model") or {}).get("display_name") or "scoped"
+        print("weekly (%s)\t%s\t%s" % (model, lim.get("percent"), lim.get("resets_at") or ""))
+PY
+  else
+    err "usage needs jq or python3"
+    return 1
+  fi
+}
+
+fmt_reset() { # "2026-09-06T00:00:00.204+00:00" -> "2026-09-06 00:00 UTC"
+  local t="$1"
+  [ -n "$t" ] || { printf '%s' "-"; return; }
+  printf '%s' "$t" | sed -e 's/T/ /' -e 's/:[0-9][0-9]\(\.[0-9]*\)\{0,1\}+00:00$/ UTC/' -e 's/:[0-9][0-9]\(\.[0-9]*\)\{0,1\}\([+-][0-9:]*\)$/ \2/'
+}
+
+usage_bar() { # percent -> [########------------]
+  local pct="$1" filled i out=""
+  filled=$((pct / 5)); [ "$filled" -gt 20 ] && filled=20
+  i=0
+  while [ $i -lt 20 ]; do
+    if [ $i -lt "$filled" ]; then out="$out#"; else out="$out-"; fi
+    i=$((i + 1))
+  done
+  printf '[%s]' "$out"
+}
+
+cmd_usage() {
+  local names="${1:-}" name rows fetched_ms age_min now_s
+  if [ -n "$names" ]; then require_profile "$names"; else names="$(all_profiles)"; fi
+  now_s="$(date +%s)"
+  for name in $names; do
+    rows="$(usage_rows "$(config_json "$name")")" || return 1
+    if [ -z "$rows" ]; then
+      echo "$(bold "$name"): no cached usage data (launch claude once with this profile to populate it)"
+      continue
+    fi
+    fetched_ms="$(printf '%s\n' "$rows" | awk -F'\t' '$1=="fetched"{print $2}')"
+    if [ -n "$fetched_ms" ] && [ "$fetched_ms" != "0" ]; then
+      age_min=$(( (now_s - fetched_ms / 1000) / 60 ))
+      echo "$(bold "$name")  (fetched ${age_min}m ago)"
+    else
+      echo "$(bold "$name")"
+    fi
+    printf '%s\n' "$rows" | while IFS="$(printf '\t')" read -r label pct resets; do
+      [ "$label" = "fetched" ] && continue
+      printf '  %-16s %s %3s%%   resets %s\n' "$label" "$(usage_bar "$pct")" "$pct" "$(fmt_reset "$resets")"
+    done
+  done
+  echo
+  echo "Data is Claude Code's own cache, refreshed while claude runs — not live."
+}
+
 cmd_du() {
   local name dir
   printf '%-14s %-10s %-10s %s\n' "PROFILE" "TOTAL" "SESSIONS" "DIR"
@@ -638,6 +734,7 @@ main() {
     share)          cmd_share "$@" ;;
     unshare)        cmd_unshare "$@" ;;
     doctor)         cmd_doctor "$@" ;;
+    usage)          cmd_usage "$@" ;;
     du)             cmd_du "$@" ;;
     clean)          cmd_clean "$@" ;;
     shellenv)       cmd_shellenv "$@" ;;

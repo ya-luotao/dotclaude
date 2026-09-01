@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# dotclaude — manage multiple Claude Code accounts (profiles) on one machine.
+# https://github.com/ya-luotao/dotclaude
+set -euo pipefail
+
+VERSION="0.1.0"
+DOTCLAUDE_HOME="${DOTCLAUDE_HOME:-$HOME/.dotclaude}"
+PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
+
+# Items that may be shared (symlinked) between profiles. Credentials, sessions,
+# and history are deliberately excluded and can never be added via arguments.
+SHARE_WHITELIST="agents skills commands CLAUDE.md"
+SHARE_DEFAULT="agents skills commands CLAUDE.md"
+NEVER_SHARE=".credentials.json .claude.json projects history.jsonl todos sessions cache"
+
+err()  { printf 'dotclaude: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+bold() { printf '\033[1m%s\033[0m' "$1"; }
+
+usage() {
+  cat <<'EOF'
+dotclaude — manage multiple Claude Code accounts (profiles) on one machine
+
+Usage:
+  dotclaude setup <name>              Create a profile and log in to it
+  dotclaude run <name> [args...]      Launch claude with a profile ("default" = plain claude)
+  dotclaude list                      List profiles with account and login status
+  dotclaude current                   Show which profile is active here
+  dotclaude bind <name> [dir]         Bind a project directory to a profile (.dotclaude file)
+  dotclaude unbind [dir]              Remove a project binding
+  dotclaude share <name> [items...]   Symlink shared config from ~/.claude into a profile
+                                      (items: agents skills commands CLAUDE.md; default: all)
+  dotclaude unshare <name> [items...] Remove shared symlinks (restores .bak if present)
+  dotclaude doctor                    Check for common multi-account pitfalls
+  dotclaude du                        Disk usage per profile
+  dotclaude clean <name> [--days N] [--force]
+                                      Delete session transcripts older than N days (default 30).
+                                      Dry-run unless --force is given.
+  dotclaude shellenv [--alias NAME]   Print shell integration (claude() wrapper + optional alias)
+  dotclaude version                   Print version
+
+Profiles:
+  "default" is your existing login (no CLAUDE_CONFIG_DIR; uses ~/.claude).
+  Named profiles live in ~/.dotclaude/profiles/<name> via CLAUDE_CONFIG_DIR.
+
+Add to ~/.zshrc for per-project binding and an optional short alias:
+  eval "$(dotclaude shellenv --alias dc)"
+EOF
+}
+
+# ---------- helpers ----------
+
+valid_name() {
+  case "$1" in
+    ''|*[!a-zA-Z0-9_-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+profile_dir() {
+  if [ "$1" = "default" ]; then printf '%s' "$HOME/.claude"; else printf '%s' "$PROFILES_DIR/$1"; fi
+}
+
+config_json() {
+  if [ "$1" = "default" ]; then printf '%s' "$HOME/.claude.json"; else printf '%s' "$PROFILES_DIR/$1/.claude.json"; fi
+}
+
+profile_exists() {
+  [ "$1" = "default" ] && { [ -d "$HOME/.claude" ] || [ -f "$HOME/.claude.json" ]; } && return 0
+  [ -d "$PROFILES_DIR/$1" ]
+}
+
+all_profiles() {
+  # default first if present, then named profiles sorted
+  if [ -d "$HOME/.claude" ] || [ -f "$HOME/.claude.json" ]; then echo default; fi
+  if [ -d "$PROFILES_DIR" ]; then
+    ls -1 "$PROFILES_DIR" 2>/dev/null | sort
+  fi
+}
+
+# json_get FILE JQ_PATH  (jq path like .oauthAccount.emailAddress)
+json_get() {
+  local file="$1" path="$2"
+  [ -f "$file" ] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    jq -r "$path // empty" "$file" 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" "$path" <<'PY' 2>/dev/null
+import json, sys
+data = json.load(open(sys.argv[1]))
+for key in sys.argv[2].lstrip('.').split('.'):
+    if not isinstance(data, dict) or key not in data:
+        sys.exit(0)
+    data = data[key]
+if isinstance(data, (str, int, float)):
+    print(data)
+PY
+  fi
+}
+
+account_summary() {
+  # prints "email (org)" or "not logged in"
+  local cfg="$1" email org
+  email="$(json_get "$cfg" '.oauthAccount.emailAddress' || true)"
+  org="$(json_get "$cfg" '.oauthAccount.organizationName' || true)"
+  if [ -n "$email" ]; then
+    if [ -n "$org" ]; then printf '%s (%s)' "$email" "$org"; else printf '%s' "$email"; fi
+  else
+    printf 'not logged in'
+  fi
+}
+
+find_binding() {
+  # walk up from $1 looking for .dotclaude; prints "profile<TAB>dir" if found
+  local d="$1"
+  while :; do
+    if [ -f "$d/.dotclaude" ]; then
+      printf '%s\t%s\n' "$(head -n1 "$d/.dotclaude" | tr -d '[:space:]')" "$d"
+      return 0
+    fi
+    [ "$d" = "/" ] && return 1
+    d="$(dirname "$d")"
+  done
+}
+
+require_profile() {
+  profile_exists "$1" || die "profile '$1' does not exist (see: dotclaude list)"
+}
+
+# ---------- commands ----------
+
+cmd_setup() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: dotclaude setup <name>"
+  valid_name "$name" || die "invalid profile name '$name' (use letters, digits, - and _)"
+  [ "$name" = "default" ] && die "'default' is your existing ~/.claude login; it never needs setup"
+  local dir="$PROFILES_DIR/$name"
+  [ -e "$dir" ] && die "profile '$name' already exists at $dir"
+  mkdir -p "$dir"
+  echo "Created profile '$name' at $dir"
+  echo "Launching claude to log in — run /login inside, then /status to confirm the account."
+  exec env CLAUDE_CONFIG_DIR="$dir" claude
+}
+
+cmd_run() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: dotclaude run <name> [args...]"
+  shift
+  require_profile "$name"
+  if [ "$name" = "default" ]; then
+    exec env -u CLAUDE_CONFIG_DIR claude "$@"
+  fi
+  exec env CLAUDE_CONFIG_DIR="$(profile_dir "$name")" claude "$@"
+}
+
+cmd_list() {
+  local name cfg dir marker active=""
+  active="$(cmd_current_name)"
+  printf '%-14s %-42s %s\n' "PROFILE" "ACCOUNT" "DIR"
+  for name in $(all_profiles); do
+    dir="$(profile_dir "$name")"
+    cfg="$(config_json "$name")"
+    marker=" "
+    [ "$name" = "$active" ] && marker="*"
+    printf '%s %-12s %-42s %s\n' "$marker" "$name" "$(account_summary "$cfg")" "$dir"
+  done
+  [ -n "$active" ] && echo && echo "* = active in this directory/environment"
+}
+
+cmd_current_name() {
+  # precedence: explicit env > project binding > default
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    local n
+    n="$(basename "$CLAUDE_CONFIG_DIR")"
+    if [ "$(dirname "$CLAUDE_CONFIG_DIR")" = "$PROFILES_DIR" ]; then printf '%s' "$n"; else printf '%s' "$CLAUDE_CONFIG_DIR"; fi
+    return
+  fi
+  local hit
+  if hit="$(find_binding "$PWD")"; then
+    printf '%s' "$(printf '%s' "$hit" | cut -f1)"
+    return
+  fi
+  printf 'default'
+}
+
+cmd_current() {
+  local name src=""
+  name="$(cmd_current_name)"
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    src="CLAUDE_CONFIG_DIR is set"
+  else
+    local hit
+    if hit="$(find_binding "$PWD")"; then src="bound via $(printf '%s' "$hit" | cut -f2)/.dotclaude"; else src="no binding; default login"; fi
+  fi
+  echo "$name  ($src)"
+}
+
+cmd_bind() {
+  local name="${1:-}" dir="${2:-$PWD}"
+  [ -n "$name" ] || die "usage: dotclaude bind <name> [dir]"
+  require_profile "$name"
+  [ -d "$dir" ] || die "no such directory: $dir"
+  printf '%s\n' "$name" > "$dir/.dotclaude"
+  echo "Bound $dir -> profile '$name'"
+  if [ -d "$dir/.git" ] && ! grep -qs '^\.dotclaude$' "$dir/.gitignore" 2>/dev/null; then
+    echo "Hint: add .dotclaude to $dir/.gitignore (binding is machine-local)."
+  fi
+  if [ "${DOTCLAUDE_WRAPPER:-}" != "1" ]; then
+    echo "Hint: binding takes effect via the claude() wrapper — add to ~/.zshrc:"
+    echo '  eval "$(dotclaude shellenv --alias dc)"'
+  fi
+}
+
+cmd_unbind() {
+  local dir="${1:-$PWD}"
+  if [ -f "$dir/.dotclaude" ]; then
+    rm "$dir/.dotclaude"
+    echo "Removed binding in $dir"
+  else
+    err "no .dotclaude file in $dir (bindings in parent dirs are left alone)"
+  fi
+}
+
+in_whitelist() {
+  local item w
+  for w in $SHARE_WHITELIST; do [ "$1" = "$w" ] && return 0; done
+  return 1
+}
+
+cmd_share() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: dotclaude share <name> [items...]"
+  [ "$name" = "default" ] && die "default is the share source; pick a named profile"
+  require_profile "$name"
+  shift
+  local items="${*:-$SHARE_DEFAULT}" item src dst
+  local dir="$PROFILES_DIR/$name"
+  for item in $items; do
+    in_whitelist "$item" || die "'$item' is not shareable (allowed: $SHARE_WHITELIST)"
+    src="$HOME/.claude/$item"
+    dst="$dir/$item"
+    if [ ! -e "$src" ]; then
+      err "skip $item: $src does not exist"
+      continue
+    fi
+    if [ -L "$dst" ]; then
+      [ "$(readlink "$dst")" = "$src" ] && { echo "ok   $item (already shared)"; continue; }
+      rm "$dst"
+    elif [ -e "$dst" ]; then
+      mv "$dst" "$dst.bak"
+      echo "note $item: existing file moved to $dst.bak"
+    fi
+    ln -s "$src" "$dst"
+    echo "link $item -> $src"
+  done
+}
+
+cmd_unshare() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: dotclaude unshare <name> [items...]"
+  require_profile "$name"
+  shift
+  local items="${*:-$SHARE_DEFAULT}" item dst
+  local dir="$PROFILES_DIR/$name"
+  for item in $items; do
+    dst="$dir/$item"
+    if [ -L "$dst" ]; then
+      rm "$dst"
+      if [ -e "$dst.bak" ]; then
+        mv "$dst.bak" "$dst"
+        echo "restored $item from $dst.bak"
+      else
+        echo "unlinked $item"
+      fi
+    else
+      err "skip $item: not a shared symlink"
+    fi
+  done
+}
+
+cmd_doctor() {
+  local problems=0 name cfg dir
+
+  echo "$(bold 'dotclaude doctor')"
+  echo
+
+  if command -v claude >/dev/null 2>&1; then
+    echo "ok    claude found: $(command -v claude)"
+  else
+    echo "FAIL  claude not found in PATH"
+    problems=$((problems + 1))
+  fi
+
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "WARN  ANTHROPIC_API_KEY is set — it overrides /login for EVERY profile."
+    echo "      unset it (or scope it per-project) or all profiles bill to that key."
+    problems=$((problems + 1))
+  else
+    echo "ok    ANTHROPIC_API_KEY not set"
+  fi
+
+  if [ "${DOTCLAUDE_WRAPPER:-}" = "1" ]; then
+    echo "ok    shell wrapper active (project bindings work for interactive 'claude')"
+  else
+    echo "note  shell wrapper not active — .dotclaude bindings are ignored by plain 'claude'."
+    echo "      add to ~/.zshrc:  eval \"\$(dotclaude shellenv --alias dc)\""
+  fi
+
+  for name in $(all_profiles); do
+    cfg="$(config_json "$name")"
+    dir="$(profile_dir "$name")"
+    if [ ! -f "$cfg" ]; then
+      echo "note  profile '$name': no .claude.json yet (never launched?)"
+      continue
+    fi
+    echo "ok    profile '$name': $(account_summary "$cfg")"
+    # dangling shared symlinks
+    local item dst
+    for item in $SHARE_WHITELIST; do
+      dst="$dir/$item"
+      if [ -L "$dst" ] && [ ! -e "$dst" ]; then
+        echo "FAIL  profile '$name': $item is a dangling symlink ($(readlink "$dst"))"
+        problems=$((problems + 1))
+      fi
+    done
+  done
+
+  echo
+  if [ "$problems" -eq 0 ]; then echo "No problems found."; else echo "$problems problem(s) found."; fi
+}
+
+cmd_du() {
+  local name dir
+  printf '%-14s %-10s %-10s %s\n' "PROFILE" "TOTAL" "SESSIONS" "DIR"
+  for name in $(all_profiles); do
+    dir="$(profile_dir "$name")"
+    [ -d "$dir" ] || continue
+    printf '%-14s %-10s %-10s %s\n' \
+      "$name" \
+      "$(du -sh "$dir" 2>/dev/null | cut -f1)" \
+      "$( [ -d "$dir/projects" ] && du -sh "$dir/projects" 2>/dev/null | cut -f1 || echo '-')" \
+      "$dir"
+  done
+}
+
+cmd_clean() {
+  local name="${1:-}" days=30 force=0
+  [ -n "$name" ] || die "usage: dotclaude clean <name> [--days N] [--force]"
+  require_profile "$name"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days) days="${2:-}"; shift 2 ;;
+      --force) force=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  case "$days" in ''|*[!0-9]*) die "--days needs a number" ;; esac
+
+  local dir projects
+  dir="$(profile_dir "$name")"
+  projects="$dir/projects"
+  [ -d "$projects" ] || { echo "No sessions in profile '$name'."; return 0; }
+
+  local count size
+  count="$(find "$projects" -name '*.jsonl' -type f -mtime +"$days" | wc -l | tr -d ' ')"
+  if [ "$count" -eq 0 ]; then
+    echo "Nothing older than $days days in profile '$name'."
+    return 0
+  fi
+  # sum per-file sizes ourselves: `xargs du -ch | tail -1` under-reports when
+  # xargs splits a large file list into batches
+  size="$(find "$projects" -name '*.jsonl' -type f -mtime +"$days" -print0 | xargs -0 du -k 2>/dev/null | awk '{s+=$1} END {if (s>1048576) printf "%.1fG", s/1048576; else if (s>1024) printf "%.1fM", s/1024; else printf "%dK", s}')"
+
+  if [ "$force" -eq 1 ]; then
+    find "$projects" -name '*.jsonl' -type f -mtime +"$days" -delete
+    echo "Deleted $count session transcript(s) ($size) older than $days days from profile '$name'."
+  else
+    echo "Would delete $count session transcript(s) ($size) older than $days days from profile '$name'."
+    echo "Dry run — pass --force to actually delete. Sample:"
+    find "$projects" -name '*.jsonl' -type f -mtime +"$days" | head -5 | sed 's/^/  /'
+  fi
+}
+
+cmd_shellenv() {
+  local alias_name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --alias) alias_name="${2:-}"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  cat <<EOF
+# dotclaude shell integration
+export DOTCLAUDE_WRAPPER=1
+claude() {
+  if [ -z "\${CLAUDE_CONFIG_DIR:-}" ]; then
+    local _dc_dir="\$PWD" _dc_profile=""
+    while :; do
+      if [ -f "\$_dc_dir/.dotclaude" ]; then
+        _dc_profile=\$(head -n1 "\$_dc_dir/.dotclaude" | tr -d '[:space:]')
+        break
+      fi
+      [ "\$_dc_dir" = "/" ] && break
+      _dc_dir=\$(dirname "\$_dc_dir")
+    done
+    if [ -n "\$_dc_profile" ] && [ "\$_dc_profile" != "default" ]; then
+      if [ -d "\${DOTCLAUDE_HOME:-\$HOME/.dotclaude}/profiles/\$_dc_profile" ]; then
+        CLAUDE_CONFIG_DIR="\${DOTCLAUDE_HOME:-\$HOME/.dotclaude}/profiles/\$_dc_profile" command claude "\$@"
+        return
+      fi
+      echo "dotclaude: profile '\$_dc_profile' not found (from \$_dc_dir/.dotclaude)" >&2
+      return 1
+    fi
+  fi
+  command claude "\$@"
+}
+EOF
+  if [ -n "$alias_name" ]; then
+    printf "alias %s='dotclaude'\n" "$alias_name"
+  fi
+}
+
+# ---------- dispatch ----------
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    setup)          cmd_setup "$@" ;;
+    run)            cmd_run "$@" ;;
+    list|ls)        cmd_list "$@" ;;
+    current)        cmd_current "$@" ;;
+    bind)           cmd_bind "$@" ;;
+    unbind)         cmd_unbind "$@" ;;
+    share)          cmd_share "$@" ;;
+    unshare)        cmd_unshare "$@" ;;
+    doctor)         cmd_doctor "$@" ;;
+    du)             cmd_du "$@" ;;
+    clean)          cmd_clean "$@" ;;
+    shellenv)       cmd_shellenv "$@" ;;
+    version|-v|--version) echo "dotclaude $VERSION" ;;
+    help|-h|--help) usage ;;
+    *)              die "unknown command: $cmd (see: dotclaude help)" ;;
+  esac
+}
+
+main "$@"

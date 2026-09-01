@@ -1,0 +1,121 @@
+# dotclaude
+
+Run multiple Claude Code accounts (e.g. personal + team) on one machine, without
+them stepping on each other — plus a few chores that come with that setup.
+
+Claude Code has no built-in account switcher. Its documented isolation mechanism
+is `CLAUDE_CONFIG_DIR`: each config directory gets its own credentials, settings,
+sessions, and (on macOS) its own Keychain entry. `dotclaude` wraps that mechanism
+into profiles.
+
+## Install
+
+```sh
+git clone https://github.com/ya-luotao/dotclaude ~/space/dotclaude
+~/space/dotclaude/install.sh
+```
+
+Then add to `~/.zshrc` (pick any alias — `dc`, `dcl`, or none):
+
+```sh
+eval "$(dotclaude shellenv --alias dc)"
+```
+
+## Concepts
+
+- **`default` profile** — your existing login. It is represented by *not* setting
+  `CLAUDE_CONFIG_DIR` at all (config lives at `~/.claude` + `~/.claude.json`).
+  Do **not** set `CLAUDE_CONFIG_DIR=~/.claude` manually: with the env var set,
+  Claude Code looks for `.claude.json` *inside* the directory, which is not where
+  the default login keeps it — you'd look logged out.
+- **Named profiles** — live at `~/.dotclaude/profiles/<name>`, activated by
+  setting `CLAUDE_CONFIG_DIR` to that path.
+
+## Usage
+
+```sh
+dotclaude setup team          # create profile "team", opens claude to /login
+dotclaude list                # profiles + which account each is logged into
+dotclaude run team            # launch claude as "team" (any extra args pass through)
+dotclaude run default         # launch claude as your original login
+dotclaude current             # which profile applies right here
+```
+
+### Per-project binding
+
+```sh
+cd ~/work/company-repo
+dotclaude bind team           # writes .dotclaude (add it to .gitignore)
+claude                        # now automatically uses the team profile
+```
+
+Binding works through the `claude()` shell wrapper from `shellenv`: it walks up
+from `$PWD` looking for a `.dotclaude` file. An explicitly set
+`CLAUDE_CONFIG_DIR` always wins over a binding.
+
+> **Limitation:** anything that invokes the `claude` *binary* directly — scripts,
+> herdr panes, CI, other tools — bypasses the shell function and gets the default
+> account. For those, use `dotclaude run <name>` or set `CLAUDE_CONFIG_DIR`
+> explicitly.
+
+### Sharing config between profiles
+
+Your agents, skills, commands, and global `CLAUDE.md` are usually
+account-independent. Share them from `~/.claude` into a profile via symlinks:
+
+```sh
+dotclaude share team                      # links agents/ skills/ commands/ CLAUDE.md
+dotclaude share team agents CLAUDE.md     # or pick specific items
+dotclaude unshare team                    # remove links (restores .bak backups)
+```
+
+Only those four items are shareable. Credentials, sessions (`projects/`),
+history, and `.claude.json` are hardcoded as never-shareable — sharing them
+would break account isolation (see FAQ).
+
+### Chores
+
+```sh
+dotclaude doctor                    # ANTHROPIC_API_KEY pollution, login status,
+                                    # dangling share links, wrapper active?
+dotclaude du                        # disk usage per profile (sessions get big)
+dotclaude clean team --days 60      # dry-run: what would be deleted
+dotclaude clean team --days 60 --force   # actually delete old transcripts
+```
+
+## Verify isolation once (recommended)
+
+Two-account credential isolation via `CLAUDE_CONFIG_DIR` is how the credential
+system behaves, but multi-account is not an officially documented workflow. After
+setting up your second profile, verify once:
+
+1. `dotclaude run team` → `/status` shows the team account.
+2. `dotclaude run default` → `/status` still shows your personal account.
+
+If step 2 ever shows the team account, isolation broke (e.g. a Claude Code
+update changed Keychain behavior) — please open an issue.
+
+## FAQ
+
+**Can sessions live in one shared place across profiles?**
+No. There is no official knob to relocate sessions separately from the config
+dir, and symlinking `projects/` across profiles risks concurrent-write
+corruption and unpredictable `--resume` behavior. Keep sessions per-profile;
+use `/export` to move a conversation across accounts.
+
+**Why does `doctor` warn about `ANTHROPIC_API_KEY`?**
+If set, it overrides `/login` credentials for every profile — all usage bills
+to that key regardless of which profile you launch.
+
+**Where does a profile's login live?**
+macOS Keychain (appears to be keyed per config dir — run the verification
+above once to confirm on your machine), falling back to
+`<profile>/.credentials.json` (mode 0600, plaintext) when the Keychain is
+unavailable (SSH, containers).
+
+## Uninstall
+
+```sh
+rm ~/.local/bin/dotclaude
+# per-profile data stays in ~/.dotclaude/profiles — delete manually if wanted
+```

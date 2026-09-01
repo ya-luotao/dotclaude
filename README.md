@@ -94,9 +94,40 @@ dotclaude share team agents CLAUDE.md     # or pick specific items
 dotclaude unshare team                    # remove links (restores .bak backups)
 ```
 
-Only those four items are shareable. Credentials, sessions (`projects/`),
-history, and `.claude.json` are hardcoded as never-shareable — sharing them
-would break account isolation (see FAQ).
+Only those four items are shared by default. Credentials, history, and
+`.claude.json` are hardcoded as never-shareable — sharing them would break
+account isolation (see FAQ).
+
+### Sharing sessions between profiles (opt-in)
+
+Session transcripts (`projects/`) can be shared too, but only by naming the
+item explicitly — it merges session history across accounts, so it never
+happens implicitly:
+
+```sh
+dotclaude share team projects     # merge team's transcripts into ~/.claude/projects,
+                                  # keep the original as projects.bak, then symlink
+dotclaude unshare team projects   # restore pre-share transcripts; transcripts
+                                  # created while shared stay in ~/.claude/projects
+```
+
+Afterwards every sharing profile sees and resumes the same sessions
+(`--resume`/`--continue`), project memory included. Two things to know:
+
+- **Set a retention horizon on every participating profile**
+  (`dotclaude keep <name>`, default profile included) — otherwise one
+  profile's 30-day default cleanup prunes the shared store for everyone.
+  `doctor` warns about this.
+- `clean` refuses a sessions-sharing profile; prune the shared store
+  deliberately with `dotclaude clean default`.
+- Run `share <name> projects` while no `claude` is running in that profile —
+  a transcript written mid-share can end up in `projects.bak` instead of the
+  shared store.
+
+Prompt history, `todos/`, and per-project trust/settings stay per-profile —
+only the transcripts and project memory are shared. Whether merging session
+history across accounts is appropriate in your situation is on you (see the
+disclaimer at the top).
 
 ### Chores
 
@@ -123,10 +154,13 @@ update changed Keychain behavior) — please open an issue.
 ## FAQ
 
 **Can sessions live in one shared place across profiles?**
-No. There is no official knob to relocate sessions separately from the config
-dir, and symlinking `projects/` across profiles risks concurrent-write
-corruption and unpredictable `--resume` behavior. Keep sessions per-profile;
-use `/export` to move a conversation across accounts.
+Yes, as an explicit opt-in: `dotclaude share <name> projects` (see above).
+There is no official knob to relocate sessions separately from the config
+dir, so this symlinks `projects/` into the shared store. Transcripts are
+UUID-named jsonl files, so concurrent profiles don't collide on writes; the
+real hazard is retention (one profile's cleanup pruning everyone's
+transcripts), which `keep` + `doctor` cover. If you only want to move a
+single conversation across accounts, `/export` still works.
 
 **Why does `doctor` warn about `ANTHROPIC_API_KEY`?**
 If set, it overrides `/login` credentials for every profile — all usage bills

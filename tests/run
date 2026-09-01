@@ -189,11 +189,75 @@ s10_wrapper_works_in_zsh() {
 
 s7_share_rejects_non_whitelist() {
   mk_profile team
-  for item in projects .credentials.json .claude.json history.jsonl sessions todos; do
+  for item in .credentials.json .claude.json history.jsonl sessions todos; do
     run_dc share team "$item"
     assert_status 1
     assert_contains "not shareable"
   done
+}
+s7_share_default_set_excludes_projects() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/agents"
+  run_dc share team
+  assert_status 0
+  [ ! -L "$DOTCLAUDE_HOME/profiles/team/projects" ] || fail_now "bare share must not link projects"
+}
+s7_share_projects_merges_and_links() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/projects/proj-a"
+  echo shared-old > "$HOME/.claude/projects/proj-a/shared.jsonl"
+  mkdir -p "$DOTCLAUDE_HOME/profiles/team/projects/proj-a"
+  echo team-only > "$DOTCLAUDE_HOME/profiles/team/projects/proj-a/team.jsonl"
+  echo team-ver  > "$DOTCLAUDE_HOME/profiles/team/projects/proj-a/shared.jsonl"
+  run_dc share team projects
+  assert_status 0
+  assert_symlink "$DOTCLAUDE_HOME/profiles/team/projects"
+  # profile transcript merged into the shared store
+  assert_file "$HOME/.claude/projects/proj-a/team.jsonl"
+  # shared store version never overwritten by the merge
+  [ "$(cat "$HOME/.claude/projects/proj-a/shared.jsonl")" = "shared-old" ] || fail_now "merge overwrote shared store"
+  # original kept as .bak
+  assert_file "$DOTCLAUDE_HOME/profiles/team/projects.bak/proj-a/team.jsonl"
+  # cleanupPeriodDays unset -> keep suggestion
+  assert_contains "dotclaude keep team"
+}
+s7_share_projects_refuses_foreign_symlink() {
+  mk_profile team
+  mkdir -p "$SB/external-store"
+  echo ext > "$SB/external-store/ext.jsonl"
+  ln -s "$SB/external-store" "$DOTCLAUDE_HOME/profiles/team/projects"
+  run_dc share team projects
+  assert_status 1
+  assert_contains "not touching it"
+  # link and its target untouched
+  assert_symlink "$DOTCLAUDE_HOME/profiles/team/projects"
+  assert_file "$SB/external-store/ext.jsonl"
+}
+s7_share_projects_refuses_stale_bak() {
+  mk_profile team
+  mkdir -p "$DOTCLAUDE_HOME/profiles/team/projects" "$DOTCLAUDE_HOME/profiles/team/projects.bak"
+  echo x > "$DOTCLAUDE_HOME/profiles/team/projects/x.jsonl"
+  run_dc share team projects
+  assert_status 1
+  assert_contains "projects.bak already exists"
+  # nothing moved or linked
+  [ ! -L "$DOTCLAUDE_HOME/profiles/team/projects" ] || fail_now "must not link over stale .bak"
+  assert_file "$DOTCLAUDE_HOME/profiles/team/projects/x.jsonl"
+}
+s7_unshare_projects_keeps_shared_transcripts() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/projects" "$DOTCLAUDE_HOME/profiles/team/projects"
+  echo pre > "$DOTCLAUDE_HOME/profiles/team/projects/pre.jsonl"
+  run_dc share team projects
+  echo during > "$HOME/.claude/projects/during.jsonl"
+  run_dc unshare team projects
+  assert_status 0
+  [ ! -L "$DOTCLAUDE_HOME/profiles/team/projects" ] || fail_now "symlink not removed"
+  # pre-share transcript restored to the profile
+  assert_file "$DOTCLAUDE_HOME/profiles/team/projects/pre.jsonl"
+  # transcript created while shared stays in the shared store
+  assert_file "$HOME/.claude/projects/during.jsonl"
+  assert_no_file "$DOTCLAUDE_HOME/profiles/team/projects/during.jsonl"
 }
 s7_share_links_and_backs_up() {
   mk_profile team
@@ -252,6 +316,26 @@ s8_clean_force_deletes_only_old_jsonl() {
 }
 s8_clean_rejects_bad_days()   { mk_profile team; run_dc clean team --days abc; assert_status 1; }
 s8_clean_unknown_profile()    { run_dc clean ghost; assert_status 1; }
+s8_clean_refuses_shared_profile() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/projects"
+  run_dc share team projects
+  run_dc clean team --days 30 --force
+  assert_status 1
+  assert_contains "shares its sessions"
+  assert_contains "clean default"
+}
+s8_clean_default_prunes_shared_store() {
+  mk_profile team
+  local p="$HOME/.claude/projects/proj-a"
+  mkdir -p "$p"
+  echo old > "$p/old.jsonl"; touch -t 202501010000 "$p/old.jsonl"
+  echo new > "$p/new.jsonl"
+  run_dc clean default --days 30 --force
+  assert_status 0
+  assert_no_file "$p/old.jsonl"
+  assert_file "$p/new.jsonl"
+}
 
 # ---------- S9: list / doctor ----------
 
@@ -276,6 +360,61 @@ s9_doctor_flags_dangling_share() {
   echo '{}' > "$DOTCLAUDE_HOME/profiles/team/.claude.json"
   run_dc doctor
   assert_contains "dangling symlink"
+}
+s9_doctor_warns_shared_sessions_cleanup() {
+  mk_profile team team@example.com
+  mkdir -p "$HOME/.claude/projects"
+  run_dc share team projects
+  run_dc doctor
+  assert_contains "sessions shared with default"
+  # neither team nor default has cleanupPeriodDays set -> both warned
+  assert_contains "dotclaude keep team"
+  assert_contains "dotclaude keep default"
+  assert_contains "problem(s) found"
+}
+s9_doctor_ok_when_retention_set() {
+  mk_profile team team@example.com
+  mkdir -p "$HOME/.claude/projects"
+  run_dc share team projects
+  run_dc keep team --days 365
+  run_dc keep default --days 365
+  run_dc doctor
+  assert_contains "sessions shared with default"
+  assert_not_contains "prunes the SHARED"
+}
+s9_doctor_reports_share_before_first_launch() {
+  mk_profile team   # no email -> no .claude.json yet
+  mkdir -p "$HOME/.claude/projects"
+  run_dc share team projects
+  run_dc doctor
+  assert_contains "sessions shared with default"
+  assert_contains "dotclaude keep team"
+  assert_contains "dotclaude keep default"
+}
+s9_doctor_skips_cleanup_check_without_json_tools() {
+  mk_profile team team@example.com
+  mkdir -p "$HOME/.claude/projects"
+  run_dc share team projects
+  # PATH with every /usr/bin tool except python3 and jq
+  mkdir -p "$SB/nojson"
+  local f
+  for f in /usr/bin/*; do ln -s "$f" "$SB/nojson/$(basename "$f")" 2>/dev/null || true; done
+  rm -f "$SB/nojson/python3" "$SB/nojson/jq"
+  local oldpath="$PATH"
+  PATH="$SB/bin:$SB/nojson:/bin"
+  run_dc doctor
+  PATH="$oldpath"
+  assert_status 0
+  assert_contains "sessions shared with default"
+  assert_not_contains "prunes the SHARED"
+}
+s9_du_marks_shared_sessions() {
+  mk_profile team team@example.com
+  mkdir -p "$HOME/.claude/projects"
+  run_dc share team projects
+  run_dc du
+  assert_status 0
+  assert_contains "shared"
 }
 
 # ---------- S13: usage ----------
@@ -421,10 +560,17 @@ t "S10 wrapper works in zsh"                   s10_wrapper_works_in_zsh
 t "S7 share rejects non-whitelist items"       s7_share_rejects_non_whitelist
 t "S7 share links items, backs up files"       s7_share_links_and_backs_up
 t "S7 share refuses default"                   s7_share_refuses_default
+t "S7 bare share excludes projects"            s7_share_default_set_excludes_projects
+t "S7 share projects merges and links"         s7_share_projects_merges_and_links
+t "S7 share projects refuses foreign symlink"  s7_share_projects_refuses_foreign_symlink
+t "S7 share projects refuses stale .bak"       s7_share_projects_refuses_stale_bak
+t "S7 unshare projects keeps shared jsonl"     s7_unshare_projects_keeps_shared_transcripts
 t "S7 unshare restores backup"                 s7_unshare_restores_backup
 t "S7 unshare never deletes real files"        s7_unshare_never_deletes_real_files
 t "S8 clean is dry-run by default"             s8_clean_dry_run_by_default
 t "S8 clean --force deletes only old jsonl"    s8_clean_force_deletes_only_old_jsonl
+t "S8 clean refuses shared profile"            s8_clean_refuses_shared_profile
+t "S8 clean default prunes shared store"       s8_clean_default_prunes_shared_store
 t "S8 clean rejects non-numeric --days"        s8_clean_rejects_bad_days
 t "S8 clean unknown profile errors"            s8_clean_unknown_profile
 t "S14 keep sets cleanupPeriodDays"            s14_keep_sets_retention
@@ -444,6 +590,11 @@ t "S12 help on unknown topic errors"           s12_help_unknown_topic_errors
 t "S9 list shows accounts and login status"    s9_list_shows_accounts
 t "S9 doctor warns on ANTHROPIC_API_KEY"       s9_doctor_warns_api_key
 t "S9 doctor flags dangling share symlink"     s9_doctor_flags_dangling_share
+t "S9 doctor warns shared-sessions cleanup"    s9_doctor_warns_shared_sessions_cleanup
+t "S9 doctor ok when retention set"            s9_doctor_ok_when_retention_set
+t "S9 doctor sees share before first launch"   s9_doctor_reports_share_before_first_launch
+t "S9 doctor skips retention w/o json tools"   s9_doctor_skips_cleanup_check_without_json_tools
+t "S9 du marks shared sessions"                s9_du_marks_shared_sessions
 
 echo
 echo "passed: $PASS  failed: $FAIL"

@@ -67,16 +67,37 @@ fall through to another account.
 ## S7. `share` / `unshare` — config sharing
 
 - Shareable items are a **hardcoded whitelist**: `agents`, `skills`,
-  `commands`, `CLAUDE.md`. Requesting anything else is an error — in
-  particular `.credentials.json`, `.claude.json`, `projects`, `history.jsonl`,
-  `todos`, `sessions` must never become shareable, because sharing them breaks
-  account isolation.
+  `commands`, `CLAUDE.md`, plus `projects` (session transcripts) as a
+  **strictly opt-in** item — in the whitelist but never in the default set,
+  so `share <name>` without items links only the four config items.
+  Requesting anything else is an error — in particular `.credentials.json`,
+  `.claude.json`, `history.jsonl`, `todos` must never become shareable,
+  because sharing them breaks account isolation. (Sharing `projects` merges
+  session history across accounts deliberately; the caveats are printed and
+  documented, and the ToS note in the README applies.)
 - `share` symlinks items from `~/.claude/<item>` into the profile. A source
-  that doesn't exist is skipped with a notice. An existing non-symlink
-  destination is preserved as `<item>.bak` before linking.
+  that doesn't exist is skipped with a notice — except `projects`, whose
+  source directory is created. An existing non-symlink destination is
+  preserved as `<item>.bak` before linking.
+- Sharing `projects` first **merges** the profile's existing transcripts
+  into `~/.claude/projects`: files already present in the shared store are
+  never overwritten, and the merge completes before anything moves aside, so
+  a failed merge leaves the profile untouched. The original directory is
+  kept as `projects.bak`, then the symlink is created. When the profile's
+  `cleanupPeriodDays` is unset, a notice suggests `keep` (S14): the 30-day
+  default cleanup would prune the shared store (with neither `jq` nor
+  `python3` the notice is skipped — the setting is unreadable).
+- Sharing `projects` **refuses** two states rather than guessing: an existing
+  `projects` symlink pointing anywhere but the shared store (removing it
+  would silently drop those sessions from the profile, unmerged and
+  unbacked), and an existing `projects.bak` (a second `mv` would nest into
+  it and a later `unshare` would restore a corrupted tree). Both are errors
+  naming the path; nothing is modified.
 - `share default` is an error (default is the share source).
 - `unshare` removes only symlinks and restores `<item>.bak` if present; a
-  non-symlink destination is never deleted.
+  non-symlink destination is never deleted. Like `share`, `projects` must be
+  named explicitly. Unsharing `projects` restores the pre-share transcripts
+  only; transcripts created while shared remain in `~/.claude/projects`.
 
 ## S8. `clean <name> [--days N] [--force]`
 
@@ -85,6 +106,11 @@ fall through to another account.
 - `--force` deletes only `*.jsonl` files under `<profile>/projects` strictly
   older than N days (default 30). Newer transcripts and non-jsonl files are
   untouched.
+- A profile whose `projects` is a symlink (shared sessions, S7) is refused
+  with an error — cleaning through the link would delete every profile's
+  transcripts. The error points at `clean default`.
+- `clean default` is supported and operates on `~/.claude/projects` — the
+  deliberate way to prune the shared store.
 - Non-numeric `--days` is an error.
 
 ## S9. Introspection: `list`, `current`, `doctor`, `du`
@@ -97,6 +123,15 @@ fall through to another account.
 - `current` names the active profile and why (env / binding / route / none).
 - `doctor` warns when `ANTHROPIC_API_KEY` is set (it overrides `/login` for
   every profile) and fails on dangling share symlinks or a broken global route.
+- `doctor` reports profiles whose sessions are shared (`projects` symlinked
+  to `~/.claude/projects`) — even for a profile that has never been launched
+  (no `.claude.json`) — and warns — counted as a problem — when any
+  participating profile (the default profile included) has no
+  `cleanupPeriodDays` set, since its 30-day default cleanup would prune the
+  shared store. With neither `jq` nor `python3` the check is skipped, never
+  an error.
+- `du` shows `shared` instead of a size in the SESSIONS column for a profile
+  whose `projects` is a symlink.
 
 ## S10. Shell wrapper scope
 

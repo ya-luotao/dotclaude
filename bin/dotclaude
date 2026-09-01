@@ -3,15 +3,17 @@
 # https://github.com/ya-luotao/dotclaude
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 DOTCLAUDE_HOME="${DOTCLAUDE_HOME:-$HOME/.dotclaude}"
 PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
 
-# Items that may be shared (symlinked) between profiles. Credentials, sessions,
-# and history are deliberately excluded and can never be added via arguments.
-SHARE_WHITELIST="agents skills commands CLAUDE.md"
+# Items that may be shared (symlinked) between profiles. Credentials and
+# history are deliberately excluded and can never be added via arguments.
+# `projects` (session transcripts) is shareable but strictly opt-in: never
+# part of the default set, because it merges session history across accounts.
+SHARE_WHITELIST="agents skills commands CLAUDE.md projects"
 SHARE_DEFAULT="agents skills commands CLAUDE.md"
-NEVER_SHARE=".credentials.json .claude.json projects history.jsonl todos sessions cache"
+NEVER_SHARE=".credentials.json .claude.json history.jsonl todos sessions cache"
 
 err()  { printf 'dotclaude: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
@@ -122,24 +124,37 @@ EOF
 ;;
     share) cat <<'EOF'
 Symlinks items from ~/.claude into the profile so both accounts see the same
-config. Shareable items (hardcoded whitelist): agents skills commands CLAUDE.md.
-Credentials, sessions, and .claude.json can never be shared — that would break
-account isolation. An existing real file is preserved as <item>.bak.
+config. Shareable items (hardcoded whitelist): agents skills commands
+CLAUDE.md projects. Credentials, history, and .claude.json can never be
+shared — that would break account isolation. An existing real file is
+preserved as <item>.bak.
 
-  dotclaude share team                  # link all four
+`projects` (session transcripts) is opt-in only — never included when items
+are omitted, because it merges session history across accounts. Sharing it
+first copies the profile's existing transcripts into ~/.claude/projects
+(the original is kept as projects.bak), then symlinks, so every sharing
+profile sees and resumes the same sessions — project memory included. Set a
+retention horizon on EVERY participating profile (dotclaude keep <name>),
+or one profile's 30-day default cleanup will prune the shared store.
+
+  dotclaude share team                  # link the four config items
   dotclaude share team agents CLAUDE.md
+  dotclaude share team projects         # opt in to shared sessions
 EOF
 ;;
     unshare) cat <<'EOF'
 Removes shared symlinks (only symlinks — a real file is never deleted) and
-restores <item>.bak if one exists.
+restores <item>.bak if one exists. Like share, `projects` must be named
+explicitly; unsharing it restores the pre-share transcripts, while
+transcripts created during sharing remain in ~/.claude/projects.
 EOF
 ;;
     doctor) cat <<'EOF'
 Checks for the pitfalls that break multi-account setups: ANTHROPIC_API_KEY
 set (overrides /login for every profile), shell wrapper not installed,
 a global route pointing at a missing profile, dangling share symlinks,
-and per-profile login status.
+per-profile login status, and — when sessions are shared — profiles whose
+default 30-day cleanup would prune the shared store.
 EOF
 ;;
     usage) cat <<'EOF'
@@ -166,8 +181,13 @@ Deletes session transcripts (*.jsonl under <profile>/projects) older than
 --days (default 30). DRY-RUN unless --force is given: without it, nothing is
 deleted and the output shows what would be.
 
+A profile with shared sessions (projects symlinked, see: dotclaude help
+share) is refused — cleaning through the link would touch every profile's
+transcripts. Prune the shared store deliberately via `clean default`.
+
   dotclaude clean team --days 60           # preview
   dotclaude clean team --days 60 --force   # actually delete
+  dotclaude clean default --days 60        # the shared store (~/.claude)
 EOF
 ;;
     keep) cat <<'EOF'
@@ -432,6 +452,66 @@ in_whitelist() {
   return 1
 }
 
+# merge_tree SRC DEST — copy every file under SRC that DEST doesn't have yet,
+# preserving relative paths. Files already in DEST are never overwritten.
+merge_tree() {
+  local from="$1" into="$2"
+  (cd "$from" && find . -type f -print0) | while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    if [ ! -e "$into/$rel" ]; then
+      # explicit exit: errexit is suspended inside functions called via ||
+      { mkdir -p "$into/$(dirname "$rel")" && cp -p "$from/$rel" "$into/$rel"; } || exit 1
+    fi
+  done
+}
+
+have_json_tool() { command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; }
+
+# Warn when a sessions-sharing profile still has Claude Code's 30-day default
+# cleanup: its auto-cleanup would prune the SHARED store for every account.
+# Without a JSON tool the setting is unreadable — skip rather than cry wolf.
+sessions_cleanup_note() {
+  local name="$1" dir="$2" days
+  have_json_tool || return 0
+  days="$(json_get "$dir/settings.json" .cleanupPeriodDays || true)"
+  if [ -z "$days" ]; then
+    echo "note cleanupPeriodDays is unset for '$name' — its 30-day default cleanup"
+    echo "     now prunes the SHARED session store. Consider: dotclaude keep $name"
+  fi
+}
+
+# Opt-in sessions sharing: merge the profile's transcripts into the shared
+# store first so nothing drops out of --resume, keep the original as
+# projects.bak, then symlink. Merge completes before anything moves aside —
+# a failure leaves the profile untouched. See SPEC S7.
+share_projects() {
+  local name="$1" dir="$2" src="$3" dst="$4"
+  mkdir -p "$src"
+  if [ -L "$dst" ]; then
+    if [ "$(readlink "$dst")" = "$src" ]; then
+      echo "ok   projects (already shared)"
+      sessions_cleanup_note "$name" "$dir"
+      return 0
+    fi
+    # a foreign symlink would be discarded without merge or backup — refuse
+    die "projects in profile '$name' is already a symlink to $(readlink "$dst") — not touching it; migrate or remove it manually, then re-run"
+  fi
+  if [ -e "$dst" ] && [ -e "$dst.bak" ]; then
+    die "$dst.bak already exists (interrupted earlier share?) — mv would nest into it; resolve the stale backup first"
+  fi
+  if [ -d "$dst" ]; then
+    merge_tree "$dst" "$src" || die "merging $dst into $src failed — nothing was moved"
+    mv "$dst" "$dst.bak"
+    echo "note projects: transcripts merged into $src; original kept at $dst.bak"
+  elif [ -e "$dst" ]; then
+    mv "$dst" "$dst.bak"
+    echo "note projects: existing file moved to $dst.bak"
+  fi
+  ln -s "$src" "$dst"
+  echo "link projects -> $src (sessions now shared with the default profile)"
+  sessions_cleanup_note "$name" "$dir"
+}
+
 cmd_share() {
   local name="${1:-}"
   [ -n "$name" ] || die "usage: dotclaude share <name> [items...]"
@@ -444,6 +524,10 @@ cmd_share() {
     in_whitelist "$item" || die "'$item' is not shareable (allowed: $SHARE_WHITELIST)"
     src="$HOME/.claude/$item"
     dst="$dir/$item"
+    if [ "$item" = "projects" ]; then
+      share_projects "$name" "$dir" "$src" "$dst"
+      continue
+    fi
     if [ ! -e "$src" ]; then
       err "skip $item: $src does not exist"
       continue
@@ -522,9 +606,25 @@ cmd_doctor() {
     fi
   fi
 
+  local shared_sessions=0
   for name in $(all_profiles); do
     cfg="$(config_json "$name")"
     dir="$(profile_dir "$name")"
+    # shared sessions: flag profiles whose default cleanup prunes the store.
+    # Checked before the .claude.json gate — sharing can predate first launch.
+    if [ -L "$dir/projects" ] && [ "$(readlink "$dir/projects")" = "$HOME/.claude/projects" ]; then
+      shared_sessions=1
+      echo "ok    profile '$name': sessions shared with default (~/.claude/projects)"
+      local cpd
+      if have_json_tool; then
+        cpd="$(json_get "$dir/settings.json" .cleanupPeriodDays || true)"
+        if [ -z "$cpd" ]; then
+          echo "WARN  profile '$name': cleanupPeriodDays unset — its 30-day default cleanup"
+          echo "      prunes the SHARED session store. Fix: dotclaude keep $name"
+          problems=$((problems + 1))
+        fi
+      fi
+    fi
     if [ ! -f "$cfg" ]; then
       echo "note  profile '$name': no .claude.json yet (never launched?)"
       continue
@@ -540,6 +640,17 @@ cmd_doctor() {
       fi
     done
   done
+
+  # the default profile participates in any sessions sharing by definition
+  if [ "$shared_sessions" -eq 1 ] && have_json_tool; then
+    local default_cpd
+    default_cpd="$(json_get "$HOME/.claude/settings.json" .cleanupPeriodDays || true)"
+    if [ -z "$default_cpd" ]; then
+      echo "WARN  profile 'default': cleanupPeriodDays unset — its 30-day default cleanup"
+      echo "      prunes the SHARED session store. Fix: dotclaude keep default"
+      problems=$((problems + 1))
+    fi
+  fi
 
   echo
   if [ "$problems" -eq 0 ]; then echo "No problems found."; else echo "$problems problem(s) found."; fi
@@ -635,7 +746,7 @@ cmd_du() {
     printf '%-14s %-10s %-10s %s\n' \
       "$name" \
       "$(du -sh "$dir" 2>/dev/null | cut -f1)" \
-      "$( [ -d "$dir/projects" ] && du -sh "$dir/projects" 2>/dev/null | cut -f1 || echo '-')" \
+      "$( if [ -L "$dir/projects" ]; then echo shared; elif [ -d "$dir/projects" ]; then du -sh "$dir/projects" 2>/dev/null | cut -f1; else echo '-'; fi )" \
       "$dir"
   done
 }
@@ -657,6 +768,12 @@ cmd_clean() {
   local dir projects
   dir="$(profile_dir "$name")"
   projects="$dir/projects"
+  # -L before -d: -d dereferences symlinks and would walk into the shared store
+  if [ -L "$projects" ]; then
+    err "profile '$name' shares its sessions — projects is a symlink to the shared store."
+    err "clean the shared store deliberately instead: dotclaude clean default"
+    exit 1
+  fi
   [ -d "$projects" ] || { echo "No sessions in profile '$name'."; return 0; }
 
   local count size

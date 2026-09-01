@@ -38,8 +38,22 @@ dotclaude setup team          # create profile "team", opens claude to /login
 dotclaude list                # profiles + which account each is logged into
 dotclaude run team            # launch claude as "team" (any extra args pass through)
 dotclaude run default         # launch claude as your original login
+dotclaude use team            # route bare `claude` to "team" globally
 dotclaude current             # which profile applies right here
 ```
+
+### Global routing
+
+Make bare `claude` use a profile everywhere, not just in bound projects:
+
+```sh
+dotclaude use team            # bare `claude` now runs as "team" globally
+dotclaude use                 # show the current global route
+dotclaude use default         # clear it — back to your original login
+```
+
+Resolution order for bare `claude` (via the shell wrapper):
+explicit `CLAUDE_CONFIG_DIR` > project `.dotclaude` binding > global route > default.
 
 ### Per-project binding
 

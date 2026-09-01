@@ -3,7 +3,7 @@
 # https://github.com/ya-luotao/dotclaude
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOTCLAUDE_HOME="${DOTCLAUDE_HOME:-$HOME/.dotclaude}"
 PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
 
@@ -24,6 +24,8 @@ dotclaude — manage multiple Claude Code accounts (profiles) on one machine
 Usage:
   dotclaude setup <name>              Create a profile and log in to it
   dotclaude run <name> [args...]      Launch claude with a profile ("default" = plain claude)
+  dotclaude use [name|default]        Route bare 'claude' globally to a profile
+                                      (no arg: show; "default": clear the route)
   dotclaude list                      List profiles with account and login status
   dotclaude current                   Show which profile is active here
   dotclaude bind <name> [dir]         Bind a project directory to a profile (.dotclaude file)
@@ -153,6 +155,35 @@ cmd_run() {
   exec env CLAUDE_CONFIG_DIR="$(profile_dir "$name")" claude "$@"
 }
 
+global_route() {
+  # prints the globally routed profile name, if any
+  [ -f "$DOTCLAUDE_HOME/current" ] && head -n1 "$DOTCLAUDE_HOME/current" | tr -d '[:space:]'
+}
+
+cmd_use() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    local cur
+    cur="$(global_route || true)"
+    if [ -n "$cur" ]; then echo "$cur"; else echo "no global route (bare 'claude' uses the default login)"; fi
+    return
+  fi
+  if [ "$name" = "default" ]; then
+    rm -f "$DOTCLAUDE_HOME/current"
+    echo "Global route cleared — bare 'claude' uses the default login."
+    return
+  fi
+  require_profile "$name"
+  mkdir -p "$DOTCLAUDE_HOME"
+  printf '%s\n' "$name" > "$DOTCLAUDE_HOME/current"
+  echo "Global route set: bare 'claude' now uses profile '$name'."
+  echo "(project .dotclaude bindings and an explicit CLAUDE_CONFIG_DIR still win)"
+  if [ "${DOTCLAUDE_WRAPPER:-}" != "1" ]; then
+    echo "Hint: routing takes effect via the claude() wrapper — add to ~/.zshrc:"
+    echo '  eval "$(dotclaude shellenv --alias dc)"'
+  fi
+}
+
 cmd_list() {
   local name cfg dir marker active=""
   active="$(cmd_current_name)"
@@ -175,11 +206,13 @@ cmd_current_name() {
     if [ "$(dirname "$CLAUDE_CONFIG_DIR")" = "$PROFILES_DIR" ]; then printf '%s' "$n"; else printf '%s' "$CLAUDE_CONFIG_DIR"; fi
     return
   fi
-  local hit
+  local hit cur
   if hit="$(find_binding "$PWD")"; then
     printf '%s' "$(printf '%s' "$hit" | cut -f1)"
     return
   fi
+  cur="$(global_route || true)"
+  if [ -n "$cur" ]; then printf '%s' "$cur"; return; fi
   printf 'default'
 }
 
@@ -190,7 +223,13 @@ cmd_current() {
     src="CLAUDE_CONFIG_DIR is set"
   else
     local hit
-    if hit="$(find_binding "$PWD")"; then src="bound via $(printf '%s' "$hit" | cut -f2)/.dotclaude"; else src="no binding; default login"; fi
+    if hit="$(find_binding "$PWD")"; then
+      src="bound via $(printf '%s' "$hit" | cut -f2)/.dotclaude"
+    elif [ -n "$(global_route || true)" ]; then
+      src="global route via $DOTCLAUDE_HOME/current"
+    else
+      src="no binding; default login"
+    fi
   fi
   echo "$name  ($src)"
 }
@@ -306,6 +345,17 @@ cmd_doctor() {
     echo "      add to ~/.zshrc:  eval \"\$(dotclaude shellenv --alias dc)\""
   fi
 
+  local route
+  route="$(global_route || true)"
+  if [ -n "$route" ]; then
+    if profile_exists "$route"; then
+      echo "ok    global route: bare 'claude' -> profile '$route'"
+    else
+      echo "FAIL  global route points to missing profile '$route' — fix with: dotclaude use default"
+      problems=$((problems + 1))
+    fi
+  fi
+
   for name in $(all_profiles); do
     cfg="$(config_json "$name")"
     dir="$(profile_dir "$name")"
@@ -395,21 +445,27 @@ cmd_shellenv() {
 export DOTCLAUDE_WRAPPER=1
 claude() {
   if [ -z "\${CLAUDE_CONFIG_DIR:-}" ]; then
-    local _dc_dir="\$PWD" _dc_profile=""
+    local _dc_home="\${DOTCLAUDE_HOME:-\$HOME/.dotclaude}"
+    local _dc_dir="\$PWD" _dc_profile="" _dc_src=""
     while :; do
       if [ -f "\$_dc_dir/.dotclaude" ]; then
         _dc_profile=\$(head -n1 "\$_dc_dir/.dotclaude" | tr -d '[:space:]')
+        _dc_src="\$_dc_dir/.dotclaude"
         break
       fi
       [ "\$_dc_dir" = "/" ] && break
       _dc_dir=\$(dirname "\$_dc_dir")
     done
+    if [ -z "\$_dc_profile" ] && [ -f "\$_dc_home/current" ]; then
+      _dc_profile=\$(head -n1 "\$_dc_home/current" | tr -d '[:space:]')
+      _dc_src="\$_dc_home/current (global route)"
+    fi
     if [ -n "\$_dc_profile" ] && [ "\$_dc_profile" != "default" ]; then
-      if [ -d "\${DOTCLAUDE_HOME:-\$HOME/.dotclaude}/profiles/\$_dc_profile" ]; then
-        CLAUDE_CONFIG_DIR="\${DOTCLAUDE_HOME:-\$HOME/.dotclaude}/profiles/\$_dc_profile" command claude "\$@"
+      if [ -d "\$_dc_home/profiles/\$_dc_profile" ]; then
+        CLAUDE_CONFIG_DIR="\$_dc_home/profiles/\$_dc_profile" command claude "\$@"
         return
       fi
-      echo "dotclaude: profile '\$_dc_profile' not found (from \$_dc_dir/.dotclaude)" >&2
+      echo "dotclaude: profile '\$_dc_profile' not found (from \$_dc_src)" >&2
       return 1
     fi
   fi
@@ -429,6 +485,7 @@ main() {
   case "$cmd" in
     setup)          cmd_setup "$@" ;;
     run)            cmd_run "$@" ;;
+    use)            cmd_use "$@" ;;
     list|ls)        cmd_list "$@" ;;
     current)        cmd_current "$@" ;;
     bind)           cmd_bind "$@" ;;

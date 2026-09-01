@@ -139,6 +139,17 @@ Zero dependencies — each test runs in a hermetic sandbox (fresh `HOME`,
 fake `claude` binary, minimal `PATH`), so it never touches your real login
 or sessions.
 
+## Disclaimer
+
+This is a personal tool, provided **as is**, without warranty of any kind. It
+is not affiliated with or endorsed by Anthropic. It only arranges Claude Code's
+own documented `CLAUDE_CONFIG_DIR` mechanism; whether running multiple accounts
+is appropriate in your situation is on you — make sure your usage complies with
+[Anthropic's terms of service](https://www.anthropic.com/legal/consumer-terms)
+and your organization's policies (e.g. don't use it to circumvent usage limits
+or seat licensing). The author accepts no responsibility for misuse or for any
+damage arising from use of this tool.
+
 ## Uninstall
 
 ```sh

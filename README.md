@@ -127,6 +127,18 @@ above once to confirm on your machine), falling back to
 `<profile>/.credentials.json` (mode 0600, plaintext) when the Keychain is
 unavailable (SSH, containers).
 
+## Development
+
+Behavior promises live in [SPEC.md](SPEC.md); the test suite enforces them:
+
+```sh
+tests/run
+```
+
+Zero dependencies — each test runs in a hermetic sandbox (fresh `HOME`,
+fake `claude` binary, minimal `PATH`), so it never touches your real login
+or sessions.
+
 ## Uninstall
 
 ```sh

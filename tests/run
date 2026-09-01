@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# Zero-dependency test suite for dotclaude. Each test runs in a hermetic
+# sandbox: fresh HOME, fresh DOTCLAUDE_HOME, and a rebuilt PATH containing a
+# fake `claude` plus /usr/bin:/bin only — the real claude binary and the real
+# ~/.claude are unreachable. Test names reference SPEC.md sections.
+set -u
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DC="$ROOT/bin/dotclaude"
+PASS=0; FAIL=0; FAILED_NAMES=""
+
+# ---------- harness ----------
+
+sandbox() {
+  SB="$(mktemp -d "${TMPDIR:-/tmp}/dotclaude-test.XXXXXX")"
+  export HOME="$SB/home"
+  export DOTCLAUDE_HOME="$HOME/.dotclaude"
+  mkdir -p "$HOME/.claude" "$SB/bin"
+  printf '#!/bin/sh\necho "fake-claude CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-<unset>} args=[$*]"\n' > "$SB/bin/claude"
+  chmod +x "$SB/bin/claude"
+  export PATH="$SB/bin:/usr/bin:/bin"
+  unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY DOTCLAUDE_WRAPPER 2>/dev/null || true
+  cd "$SB"
+}
+
+mk_profile() { # name [email] [org]
+  local dir="$DOTCLAUDE_HOME/profiles/$1"
+  mkdir -p "$dir"
+  if [ -n "${2:-}" ]; then
+    printf '{"oauthAccount":{"emailAddress":"%s","organizationName":"%s"}}\n' "$2" "${3:-Org}" > "$dir/.claude.json"
+  fi
+}
+
+run_dc() { # capture combined output and status
+  set +e
+  OUT="$("$DC" "$@" 2>&1)"
+  STATUS=$?
+  set -e 2>/dev/null; set +e
+}
+
+fail_now() { echo "    ✗ $*"; exit 1; }
+assert_status()       { [ "$STATUS" -eq "$1" ] || fail_now "expected exit $1, got $STATUS — output: $OUT"; }
+assert_contains()     { case "$OUT" in *"$1"*) ;; *) fail_now "output missing '$1' — output: $OUT" ;; esac; }
+assert_not_contains() { case "$OUT" in *"$1"*) fail_now "output should not contain '$1' — output: $OUT" ;; esac; }
+assert_file()         { [ -e "$1" ] || fail_now "expected file to exist: $1"; }
+assert_no_file()      { [ ! -e "$1" ] || fail_now "expected file to be absent: $1"; }
+assert_symlink()      { [ -L "$1" ] || fail_now "expected symlink: $1"; }
+
+t() { # t <name> <fn>
+  local name="$1" fn="$2"
+  if ( sandbox && "$fn" ); then
+    PASS=$((PASS + 1)); echo "  ✓ $name"
+  else
+    FAIL=$((FAIL + 1)); FAILED_NAMES="$FAILED_NAMES $name"; echo "  ✗ $name"
+  fi
+}
+
+# ---------- S1/S3: setup guards ----------
+
+s3_setup_refuses_default()  { run_dc setup default; assert_status 1; assert_contains "never needs setup"; }
+s3_setup_refuses_invalid()  { run_dc setup 'bad name!'; assert_status 1; assert_contains "invalid profile name"; }
+s3_setup_refuses_existing() { mk_profile team; run_dc setup team; assert_status 1; assert_contains "already exists"; }
+s3_setup_creates_and_launches() {
+  run_dc setup team
+  assert_status 0
+  assert_file "$DOTCLAUDE_HOME/profiles/team"
+  assert_contains "CLAUDE_CONFIG_DIR=$DOTCLAUDE_HOME/profiles/team"
+}
+
+# ---------- S4: run ----------
+
+s4_run_named_sets_env() {
+  mk_profile team
+  run_dc run team --model opus
+  assert_status 0
+  assert_contains "CLAUDE_CONFIG_DIR=$DOTCLAUDE_HOME/profiles/team"
+  assert_contains "args=[--model opus]"
+}
+s4_run_default_unsets_env() {
+  export CLAUDE_CONFIG_DIR=/should/be/removed
+  run_dc run default
+  unset CLAUDE_CONFIG_DIR
+  assert_status 0
+  assert_contains "CLAUDE_CONFIG_DIR=<unset>"
+}
+s4_run_unknown_errors() { run_dc run ghost; assert_status 1; assert_contains "does not exist"; }
+
+# ---------- S5: use (global route) ----------
+
+s5_use_set_show_clear() {
+  mk_profile team
+  run_dc use team;    assert_status 0; assert_contains "Global route set"
+  run_dc use;         assert_status 0; assert_contains "team"
+  run_dc use default; assert_status 0; assert_no_file "$DOTCLAUDE_HOME/current"
+  run_dc use;         assert_contains "no global route"
+}
+s5_use_refuses_unknown() { run_dc use ghost; assert_status 1; assert_contains "does not exist"; }
+s5_doctor_flags_broken_route() {
+  mkdir -p "$DOTCLAUDE_HOME"; echo ghost > "$DOTCLAUDE_HOME/current"
+  run_dc doctor
+  assert_contains "global route points to missing profile 'ghost'"
+  assert_contains "problem(s) found"
+}
+
+# ---------- S6: bind / unbind ----------
+
+s6_bind_writes_file() {
+  mk_profile team; mkdir -p proj
+  run_dc bind team proj
+  assert_status 0
+  [ "$(cat proj/.dotclaude)" = "team" ] || fail_now "binding file content wrong"
+}
+s6_bind_refuses_unknown() { mkdir -p proj; run_dc bind ghost proj; assert_status 1; }
+s6_unbind_removes_only_local() {
+  mk_profile team; mkdir -p proj/sub
+  run_dc bind team proj
+  run_dc unbind proj/sub          # no local file here; parent must survive
+  assert_file proj/.dotclaude
+  run_dc unbind proj
+  assert_no_file proj/.dotclaude
+}
+
+# ---------- S2: resolution order (current + wrapper) ----------
+
+s2_current_default() { run_dc current; assert_contains "default"; }
+s2_current_binding_beats_route() {
+  mk_profile team; mk_profile other
+  run_dc use other
+  mkdir -p proj/sub; run_dc bind team proj
+  cd proj/sub; run_dc current
+  assert_contains "team"
+  assert_contains "bound via"
+}
+s2_current_route_when_no_binding() {
+  mk_profile team; run_dc use team
+  run_dc current
+  assert_contains "team"
+  assert_contains "global route"
+}
+
+wrapper() { # run bare `claude` through the sourced wrapper, from dir $1
+  "$DC" shellenv > "$SB/shellenv.sh" || return 1
+  set +e
+  OUT="$(cd "$1" && bash -c "source '$SB/shellenv.sh' && claude" 2>&1)"
+  STATUS=$?
+  set +e
+}
+s2_wrapper_env_wins() {
+  mk_profile team; mkdir -p proj; run_dc bind team proj
+  "$DC" shellenv > "$SB/shellenv.sh"
+  set +e
+  OUT="$(cd proj && CLAUDE_CONFIG_DIR=/explicit bash -c "source '$SB/shellenv.sh' && claude" 2>&1)"
+  STATUS=$?
+  assert_contains "CLAUDE_CONFIG_DIR=/explicit"
+}
+s2_wrapper_binding_beats_route() {
+  mk_profile team; mk_profile other; run_dc use other
+  mkdir -p proj/sub; run_dc bind team proj
+  wrapper proj/sub
+  assert_contains "profiles/team"
+}
+s2_wrapper_route_applies() {
+  mk_profile team; run_dc use team
+  mkdir -p plain; wrapper plain
+  assert_contains "profiles/team"
+}
+s2_wrapper_default_when_nothing() {
+  mkdir -p plain; wrapper plain
+  assert_contains "CLAUDE_CONFIG_DIR=<unset>"
+}
+s2_wrapper_missing_profile_errors() {
+  mkdir -p proj; echo ghost > proj/.dotclaude
+  wrapper proj
+  assert_status 1
+  assert_contains "profile 'ghost' not found"
+  assert_not_contains "fake-claude"     # must not fall through to another account
+}
+s10_wrapper_works_in_zsh() {
+  command -v zsh >/dev/null 2>&1 || return 0   # skip where zsh is absent
+  mk_profile team; run_dc use team
+  "$DC" shellenv --alias dc > "$SB/shellenv.sh"
+  set +e
+  OUT="$(zsh -c "source '$SB/shellenv.sh' && claude" 2>&1)"
+  STATUS=$?
+  assert_contains "profiles/team"
+}
+
+# ---------- S7: share / unshare ----------
+
+s7_share_rejects_non_whitelist() {
+  mk_profile team
+  for item in projects .credentials.json .claude.json history.jsonl sessions todos; do
+    run_dc share team "$item"
+    assert_status 1
+    assert_contains "not shareable"
+  done
+}
+s7_share_links_and_backs_up() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/agents"; echo global > "$HOME/.claude/CLAUDE.md"
+  echo local > "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md"
+  run_dc share team agents CLAUDE.md
+  assert_status 0
+  assert_symlink "$DOTCLAUDE_HOME/profiles/team/agents"
+  assert_symlink "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md"
+  assert_file "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md.bak"
+  [ "$(cat "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md.bak")" = "local" ] || fail_now "backup content wrong"
+}
+s7_share_refuses_default() { run_dc share default agents; assert_status 1; }
+s7_unshare_restores_backup() {
+  mk_profile team
+  echo global > "$HOME/.claude/CLAUDE.md"
+  echo local  > "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md"
+  run_dc share team CLAUDE.md
+  run_dc unshare team CLAUDE.md
+  assert_status 0
+  [ ! -L "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md" ] || fail_now "symlink not removed"
+  [ "$(cat "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md")" = "local" ] || fail_now "backup not restored"
+}
+s7_unshare_never_deletes_real_files() {
+  mk_profile team
+  echo precious > "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md"
+  run_dc unshare team CLAUDE.md
+  assert_file "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md"
+  [ "$(cat "$DOTCLAUDE_HOME/profiles/team/CLAUDE.md")" = "precious" ] || fail_now "real file was touched"
+}
+
+# ---------- S8: clean ----------
+
+mk_sessions() {
+  local p="$DOTCLAUDE_HOME/profiles/team/projects/proj-a"
+  mkdir -p "$p"
+  echo old > "$p/old.jsonl";  touch -t 202501010000 "$p/old.jsonl"
+  echo new > "$p/new.jsonl"
+  echo keep > "$p/notes.txt"; touch -t 202501010000 "$p/notes.txt"
+}
+s8_clean_dry_run_by_default() {
+  mk_profile team; mk_sessions
+  run_dc clean team --days 30
+  assert_status 0
+  assert_contains "Would delete 1"
+  assert_contains "Dry run"
+  assert_file "$DOTCLAUDE_HOME/profiles/team/projects/proj-a/old.jsonl"
+}
+s8_clean_force_deletes_only_old_jsonl() {
+  mk_profile team; mk_sessions
+  run_dc clean team --days 30 --force
+  assert_status 0
+  assert_no_file "$DOTCLAUDE_HOME/profiles/team/projects/proj-a/old.jsonl"
+  assert_file "$DOTCLAUDE_HOME/profiles/team/projects/proj-a/new.jsonl"
+  assert_file "$DOTCLAUDE_HOME/profiles/team/projects/proj-a/notes.txt"
+}
+s8_clean_rejects_bad_days()   { mk_profile team; run_dc clean team --days abc; assert_status 1; }
+s8_clean_unknown_profile()    { run_dc clean ghost; assert_status 1; }
+
+# ---------- S9: list / doctor ----------
+
+s9_list_shows_accounts() {
+  mk_profile team team@example.com "Acme Corp"
+  mk_profile fresh
+  run_dc list
+  assert_status 0
+  assert_contains "team@example.com (Acme Corp)"
+  assert_contains "not logged in"
+}
+s9_doctor_warns_api_key() {
+  export ANTHROPIC_API_KEY=sk-test
+  run_dc doctor
+  unset ANTHROPIC_API_KEY
+  assert_contains "ANTHROPIC_API_KEY is set"
+  assert_contains "problem(s) found"
+}
+s9_doctor_flags_dangling_share() {
+  mk_profile team
+  ln -s "$HOME/.claude/nonexistent-agents" "$DOTCLAUDE_HOME/profiles/team/agents"
+  echo '{}' > "$DOTCLAUDE_HOME/profiles/team/.claude.json"
+  run_dc doctor
+  assert_contains "dangling symlink"
+}
+
+# ---------- run all ----------
+
+echo "dotclaude test suite"
+echo
+
+t "S3 setup refuses 'default'"                 s3_setup_refuses_default
+t "S3 setup refuses invalid names"             s3_setup_refuses_invalid
+t "S3 setup refuses existing profile"          s3_setup_refuses_existing
+t "S3 setup creates dir, launches with env"    s3_setup_creates_and_launches
+t "S4 run named profile sets env, passes args" s4_run_named_sets_env
+t "S4 run default unsets env"                  s4_run_default_unsets_env
+t "S4 run unknown profile errors"              s4_run_unknown_errors
+t "S5 use set/show/clear"                      s5_use_set_show_clear
+t "S5 use refuses unknown profile"             s5_use_refuses_unknown
+t "S5 doctor flags broken route"               s5_doctor_flags_broken_route
+t "S6 bind writes .dotclaude"                  s6_bind_writes_file
+t "S6 bind refuses unknown profile"            s6_bind_refuses_unknown
+t "S6 unbind touches only local file"          s6_unbind_removes_only_local
+t "S2 current: default"                        s2_current_default
+t "S2 current: binding beats route"            s2_current_binding_beats_route
+t "S2 current: route when no binding"          s2_current_route_when_no_binding
+t "S2 wrapper: explicit env wins"              s2_wrapper_env_wins
+t "S2 wrapper: binding beats route"            s2_wrapper_binding_beats_route
+t "S2 wrapper: route applies"                  s2_wrapper_route_applies
+t "S2 wrapper: default when nothing set"       s2_wrapper_default_when_nothing
+t "S2 wrapper: missing profile hard-errors"    s2_wrapper_missing_profile_errors
+t "S10 wrapper works in zsh"                   s10_wrapper_works_in_zsh
+t "S7 share rejects non-whitelist items"       s7_share_rejects_non_whitelist
+t "S7 share links items, backs up files"       s7_share_links_and_backs_up
+t "S7 share refuses default"                   s7_share_refuses_default
+t "S7 unshare restores backup"                 s7_unshare_restores_backup
+t "S7 unshare never deletes real files"        s7_unshare_never_deletes_real_files
+t "S8 clean is dry-run by default"             s8_clean_dry_run_by_default
+t "S8 clean --force deletes only old jsonl"    s8_clean_force_deletes_only_old_jsonl
+t "S8 clean rejects non-numeric --days"        s8_clean_rejects_bad_days
+t "S8 clean unknown profile errors"            s8_clean_unknown_profile
+t "S9 list shows accounts and login status"    s9_list_shows_accounts
+t "S9 doctor warns on ANTHROPIC_API_KEY"       s9_doctor_warns_api_key
+t "S9 doctor flags dangling share symlink"     s9_doctor_flags_dangling_share
+
+echo
+echo "passed: $PASS  failed: $FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  echo "failed tests:$FAILED_NAMES"
+  exit 1
+fi

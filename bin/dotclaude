@@ -3,7 +3,7 @@
 # https://github.com/ya-luotao/dotclaude
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 DOTCLAUDE_HOME="${DOTCLAUDE_HOME:-$HOME/.dotclaude}"
 PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
 
@@ -35,6 +35,7 @@ doctor^^Check for common multi-account pitfalls
 usage^[name]^Show cached 5h/weekly rate-limit usage per profile
 du^^Disk usage per profile
 clean^<name> [--days N] [--force]^Delete old session transcripts (dry-run unless --force)
+keep^<name> [--days N]^Retain sessions ~forever (sets cleanupPeriodDays, default 999999)
 shellenv^[--alias NAME]^Print shell integration (claude() wrapper + optional alias)
 help^[command]^Show this help, or detailed help for one command
 version^^Print version
@@ -167,6 +168,19 @@ deleted and the output shows what would be.
 
   dotclaude clean team --days 60           # preview
   dotclaude clean team --days 60 --force   # actually delete
+EOF
+;;
+    keep) cat <<'EOF'
+Stops Claude Code from auto-deleting this profile's session transcripts by
+setting cleanupPeriodDays in the profile's settings.json (default here:
+999999 days ≈ forever; Claude Code's own default is 30). Other settings in
+the file are preserved. --days 0 is refused: a known Claude Code bug makes 0
+disable transcript writing entirely instead of disabling cleanup. Note:
+retained sessions add up — see `dotclaude du`, and use `dotclaude clean`
+when you want to prune manually.
+
+  dotclaude keep default          # keep your main login's sessions forever
+  dotclaude keep team --days 365  # or pick a horizon
 EOF
 ;;
     shellenv) cat <<'EOF'
@@ -665,6 +679,52 @@ cmd_clean() {
   fi
 }
 
+# settings_json_set FILE KEY NUM — merge one numeric key into a JSON settings
+# file, preserving everything else. Creates the file if missing.
+settings_json_set() {
+  local file="$1" key="$2" val="$3" tmp
+  [ -f "$file" ] || printf '{}\n' > "$file"
+  tmp="$file.dotclaude-tmp"
+  if command -v jq >/dev/null 2>&1; then
+    jq --arg k "$key" --argjson v "$val" '.[$k] = $v' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" "$key" "$val" > "$tmp" <<'PY' || { rm -f "$tmp"; return 1; }
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+data[sys.argv[2]] = int(sys.argv[3])
+print(json.dumps(data, indent=2))
+PY
+  else
+    err "keep needs jq or python3"
+    return 1
+  fi
+  mv "$tmp" "$file"
+}
+
+cmd_keep() {
+  local name="${1:-}" days=999999
+  [ -n "$name" ] || die "usage: dotclaude keep <name> [--days N]"
+  require_profile "$name"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days) days="${2:-}"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  case "$days" in ''|*[!0-9]*) die "--days needs a number" ;; esac
+  # cleanupPeriodDays=0 has a known Claude Code bug: it disables transcript
+  # WRITING entirely, not cleanup. Refuse it.
+  [ "$days" -eq 0 ] && die "0 would stop Claude Code writing transcripts at all (known bug) — use a large number instead"
+  local file old
+  file="$(profile_dir "$name")/settings.json"
+  old="$(json_get "$file" '.cleanupPeriodDays' || true)"
+  settings_json_set "$file" cleanupPeriodDays "$days" || exit 1
+  echo "Set cleanupPeriodDays=${days} for profile '$name' (was: ${old:-unset, default 30})"
+  echo "Claude Code will now retain this profile's session transcripts for ${days} days."
+}
+
 cmd_shellenv() {
   local alias_name=""
   while [ $# -gt 0 ]; do
@@ -737,6 +797,7 @@ main() {
     usage)          cmd_usage "$@" ;;
     du)             cmd_du "$@" ;;
     clean)          cmd_clean "$@" ;;
+    keep)           cmd_keep "$@" ;;
     shellenv)       cmd_shellenv "$@" ;;
     version|-v|--version) echo "dotclaude $VERSION" ;;
     help|-h|--help) cmd_help "$@" ;;

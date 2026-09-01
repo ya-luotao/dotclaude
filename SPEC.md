@@ -137,3 +137,16 @@ directly and get the default account unless they use `dotclaude run` or set
   a crash.
 - A profile without cached data gets a notice (exit 0); an unknown profile
   name is an error. Requires `jq` or `python3`.
+
+## S14. `keep <name> [--days N]` — session retention
+
+- Sets `cleanupPeriodDays` (Claude Code's transcript retention setting;
+  its default is 30) in the profile's `settings.json` — default value here
+  is 999999, effectively disabling auto-cleanup.
+- The merge is surgical: every other key in `settings.json` is preserved,
+  and the file is created if missing. A failed merge leaves the original
+  file untouched.
+- `--days 0` is refused: a known Claude Code bug makes `cleanupPeriodDays: 0`
+  disable transcript writing entirely rather than disabling cleanup.
+- Non-numeric `--days` and unknown profiles are errors. Requires `jq` or
+  `python3`.

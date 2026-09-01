@@ -323,6 +323,41 @@ s13_usage_all_profiles() {
   assert_contains "not live"
 }
 
+# ---------- S14: keep ----------
+
+s14_keep_sets_retention() {
+  mk_profile team
+  run_dc keep team
+  assert_status 0
+  assert_contains "cleanupPeriodDays=999999"
+  grep -q '"cleanupPeriodDays": 999999' "$DOTCLAUDE_HOME/profiles/team/settings.json" \
+    || grep -q '"cleanupPeriodDays":999999' "$DOTCLAUDE_HOME/profiles/team/settings.json" \
+    || fail_now "settings.json missing cleanupPeriodDays"
+}
+s14_keep_preserves_other_settings() {
+  mk_profile team
+  printf '{"model":"opus","cleanupPeriodDays":30}\n' > "$DOTCLAUDE_HOME/profiles/team/settings.json"
+  run_dc keep team --days 365
+  assert_status 0
+  assert_contains "was: 30"
+  grep -q '"model"' "$DOTCLAUDE_HOME/profiles/team/settings.json" || fail_now "existing setting lost"
+  grep -q '365' "$DOTCLAUDE_HOME/profiles/team/settings.json" || fail_now "days not written"
+}
+s14_keep_works_on_default() {
+  run_dc keep default
+  assert_status 0
+  assert_file "$HOME/.claude/settings.json"
+}
+s14_keep_rejects_bad_days()   { mk_profile team; run_dc keep team --days never; assert_status 1; }
+s14_keep_refuses_zero_days() {
+  mk_profile team
+  run_dc keep team --days 0
+  assert_status 1
+  assert_contains "known bug"
+  assert_no_file "$DOTCLAUDE_HOME/profiles/team/settings.json"
+}
+s14_keep_unknown_profile()    { run_dc keep ghost; assert_status 1; }
+
 # ---------- S12: self-describing help ----------
 
 help_command_names() { # extract command names from `help` output's Commands block
@@ -392,6 +427,12 @@ t "S8 clean is dry-run by default"             s8_clean_dry_run_by_default
 t "S8 clean --force deletes only old jsonl"    s8_clean_force_deletes_only_old_jsonl
 t "S8 clean rejects non-numeric --days"        s8_clean_rejects_bad_days
 t "S8 clean unknown profile errors"            s8_clean_unknown_profile
+t "S14 keep sets cleanupPeriodDays"            s14_keep_sets_retention
+t "S14 keep preserves other settings"          s14_keep_preserves_other_settings
+t "S14 keep works on default profile"          s14_keep_works_on_default
+t "S14 keep rejects bad --days"                s14_keep_rejects_bad_days
+t "S14 keep refuses --days 0 (write bug)"      s14_keep_refuses_zero_days
+t "S14 keep unknown profile errors"            s14_keep_unknown_profile
 t "S13 usage shows 5h/weekly/scoped windows"   s13_usage_shows_windows
 t "S13 usage notice when no cache"             s13_usage_no_cache_notice
 t "S13 usage unknown profile errors"           s13_usage_unknown_profile_errors

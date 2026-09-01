@@ -278,6 +278,39 @@ s9_doctor_flags_dangling_share() {
   assert_contains "dangling symlink"
 }
 
+# ---------- S12: self-describing help ----------
+
+help_command_names() { # extract command names from `help` output's Commands block
+  "$DC" help | awk '/^Commands:$/{f=1;next} f&&/^$/{exit} f{print $1}'
+}
+s12_help_lists_all_dispatch_commands() {
+  run_dc help
+  assert_status 0
+  for c in setup run use list current bind unbind share unshare doctor du clean shellenv help version; do
+    assert_contains "$c"
+  done
+}
+s12_every_listed_command_has_topic_help() {
+  local c
+  for c in $(help_command_names); do
+    run_dc help "$c"
+    assert_status 0
+    assert_contains "Usage: dotclaude $c"
+  done
+}
+s12_dashdash_help_never_executes() {
+  mk_profile team; mk_sessions
+  run_dc clean --help
+  assert_status 0
+  assert_contains "--force"
+  assert_file "$DOTCLAUDE_HOME/profiles/team/projects/proj-a/old.jsonl"
+  run_dc setup --help               # would launch claude if executed
+  assert_status 0
+  assert_contains "Usage: dotclaude setup"
+  assert_not_contains "fake-claude"
+}
+s12_help_unknown_topic_errors() { run_dc help nope; assert_status 1; assert_contains "unknown command"; }
+
 # ---------- run all ----------
 
 echo "dotclaude test suite"
@@ -314,6 +347,10 @@ t "S8 clean is dry-run by default"             s8_clean_dry_run_by_default
 t "S8 clean --force deletes only old jsonl"    s8_clean_force_deletes_only_old_jsonl
 t "S8 clean rejects non-numeric --days"        s8_clean_rejects_bad_days
 t "S8 clean unknown profile errors"            s8_clean_unknown_profile
+t "S12 help lists every command"               s12_help_lists_all_dispatch_commands
+t "S12 every listed command has topic help"    s12_every_listed_command_has_topic_help
+t "S12 --help never executes the command"      s12_dashdash_help_never_executes
+t "S12 help on unknown topic errors"           s12_help_unknown_topic_errors
 t "S9 list shows accounts and login status"    s9_list_shows_accounts
 t "S9 doctor warns on ANTHROPIC_API_KEY"       s9_doctor_warns_api_key
 t "S9 doctor flags dangling share symlink"     s9_doctor_flags_dangling_share

@@ -113,3 +113,13 @@ directly and get the default account unless they use `dotclaude run` or set
   prints the raw path instead of a profile name; `list`'s `*` marker only
   matches real profile names.
 - `unbind` on a directory without a `.dotclaude` file exits 0 (notice only).
+
+## S12. Self-describing help
+
+- The command list shown by `help` is rendered from a single command table in
+  the script — the one source of truth. Every listed command is dispatchable,
+  and every command with a `help` topic appears in the list.
+- `help <command>` prints a usage line, the one-line summary, and detailed
+  notes/examples for that command. `<command> --help` (or `-h`, as the first
+  argument) is equivalent and never executes the command.
+- `help <unknown>` is an error (exit non-zero).

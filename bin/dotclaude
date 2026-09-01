@@ -3,7 +3,7 @@
 # https://github.com/ya-luotao/dotclaude
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 DOTCLAUDE_HOME="${DOTCLAUDE_HOME:-$HOME/.dotclaude}"
 PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
 
@@ -17,37 +17,174 @@ err()  { printf 'dotclaude: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 bold() { printf '\033[1m%s\033[0m' "$1"; }
 
-usage() {
+# Single source of truth for the command list: name^args^summary.
+# `usage` renders it; `help <cmd>` validates against it; tests assert every
+# row here has a working `help` topic and a dispatch entry.
+commands_table() {
   cat <<'EOF'
-dotclaude — manage multiple Claude Code accounts (profiles) on one machine
+setup^<name>^Create a profile and log in to it
+run^<name> [args...]^Launch claude with a profile ("default" = plain claude)
+use^[name|default]^Route bare claude globally to a profile (no arg: show; default: clear)
+list^^List profiles with account and login status
+current^^Show which profile is active here and why
+bind^<name> [dir]^Bind a project directory to a profile (.dotclaude file)
+unbind^[dir]^Remove a project binding
+share^<name> [items...]^Symlink shared config from ~/.claude into a profile
+unshare^<name> [items...]^Remove shared symlinks (restores .bak if present)
+doctor^^Check for common multi-account pitfalls
+du^^Disk usage per profile
+clean^<name> [--days N] [--force]^Delete old session transcripts (dry-run unless --force)
+shellenv^[--alias NAME]^Print shell integration (claude() wrapper + optional alias)
+help^[command]^Show this help, or detailed help for one command
+version^^Print version
+EOF
+}
 
-Usage:
-  dotclaude setup <name>              Create a profile and log in to it
-  dotclaude run <name> [args...]      Launch claude with a profile ("default" = plain claude)
-  dotclaude use [name|default]        Route bare 'claude' globally to a profile
-                                      (no arg: show; "default": clear the route)
-  dotclaude list                      List profiles with account and login status
-  dotclaude current                   Show which profile is active here
-  dotclaude bind <name> [dir]         Bind a project directory to a profile (.dotclaude file)
-  dotclaude unbind [dir]              Remove a project binding
-  dotclaude share <name> [items...]   Symlink shared config from ~/.claude into a profile
-                                      (items: agents skills commands CLAUDE.md; default: all)
-  dotclaude unshare <name> [items...] Remove shared symlinks (restores .bak if present)
-  dotclaude doctor                    Check for common multi-account pitfalls
-  dotclaude du                        Disk usage per profile
-  dotclaude clean <name> [--days N] [--force]
-                                      Delete session transcripts older than N days (default 30).
-                                      Dry-run unless --force is given.
-  dotclaude shellenv [--alias NAME]   Print shell integration (claude() wrapper + optional alias)
-  dotclaude version                   Print version
+usage() {
+  echo "dotclaude $VERSION — manage multiple Claude Code accounts (profiles) on one machine"
+  echo
+  echo "Usage: dotclaude <command> [args...]"
+  echo
+  echo "Commands:"
+  commands_table | while IFS='^' read -r name args summary; do
+    printf '  %-9s %-27s %s\n' "$name" "$args" "$summary"
+  done
+  cat <<'EOF'
+
+Run 'dotclaude help <command>' (or 'dotclaude <command> --help') for details.
 
 Profiles:
   "default" is your existing login (no CLAUDE_CONFIG_DIR; uses ~/.claude).
   Named profiles live in ~/.dotclaude/profiles/<name> via CLAUDE_CONFIG_DIR.
 
-Add to ~/.zshrc for per-project binding and an optional short alias:
+Add to ~/.zshrc for per-project binding, global routing, and a short alias:
   eval "$(dotclaude shellenv --alias dc)"
 EOF
+}
+
+help_detail() {
+  case "$1" in
+    setup) cat <<'EOF'
+Creates ~/.dotclaude/profiles/<name> and launches claude with
+CLAUDE_CONFIG_DIR pointing at it — run /login inside, then /status to confirm.
+Refuses existing profiles, invalid names, and "default" (your real ~/.claude
+login never needs setup).
+
+  dotclaude setup team
+EOF
+;;
+    run) cat <<'EOF'
+Launches claude as the given profile; every extra argument passes through.
+"run default" launches with CLAUDE_CONFIG_DIR explicitly unset — the default
+login must never see the variable (it moves .claude.json lookup).
+
+  dotclaude run team
+  dotclaude run team -p "summarize this repo"
+  dotclaude run default --resume
+EOF
+;;
+    use) cat <<'EOF'
+Sets the global route: bare `claude` (via the shellenv wrapper) uses this
+profile everywhere. Resolution order stays:
+explicit CLAUDE_CONFIG_DIR > project .dotclaude binding > global route > default.
+
+  dotclaude use team       # route bare claude to "team"
+  dotclaude use            # show the current route
+  dotclaude use default    # clear the route
+EOF
+;;
+    list) cat <<'EOF'
+Lists every profile with the logged-in account (email + organization, read
+from the profile's .claude.json) and its directory. "*" marks the profile
+active in the current directory/environment.
+EOF
+;;
+    current) cat <<'EOF'
+Prints the profile that bare `claude` would use right here, and why:
+explicit CLAUDE_CONFIG_DIR, a project .dotclaude binding, the global route,
+or the default login.
+EOF
+;;
+    bind) cat <<'EOF'
+Writes the profile name to <dir>/.dotclaude (default: current directory).
+The shellenv claude() wrapper walks up from $PWD and uses the nearest
+binding. Add .dotclaude to .gitignore — bindings are machine-local.
+
+  cd ~/work/company-repo && dotclaude bind team
+EOF
+;;
+    unbind) cat <<'EOF'
+Removes <dir>/.dotclaude (default: current directory). Bindings in parent
+directories are never touched.
+EOF
+;;
+    share) cat <<'EOF'
+Symlinks items from ~/.claude into the profile so both accounts see the same
+config. Shareable items (hardcoded whitelist): agents skills commands CLAUDE.md.
+Credentials, sessions, and .claude.json can never be shared — that would break
+account isolation. An existing real file is preserved as <item>.bak.
+
+  dotclaude share team                  # link all four
+  dotclaude share team agents CLAUDE.md
+EOF
+;;
+    unshare) cat <<'EOF'
+Removes shared symlinks (only symlinks — a real file is never deleted) and
+restores <item>.bak if one exists.
+EOF
+;;
+    doctor) cat <<'EOF'
+Checks for the pitfalls that break multi-account setups: ANTHROPIC_API_KEY
+set (overrides /login for every profile), shell wrapper not installed,
+a global route pointing at a missing profile, dangling share symlinks,
+and per-profile login status.
+EOF
+;;
+    du) cat <<'EOF'
+Shows disk usage per profile, with the sessions (projects/) share broken out —
+session transcripts are usually where the gigabytes are (see: dotclaude clean).
+EOF
+;;
+    clean) cat <<'EOF'
+Deletes session transcripts (*.jsonl under <profile>/projects) older than
+--days (default 30). DRY-RUN unless --force is given: without it, nothing is
+deleted and the output shows what would be.
+
+  dotclaude clean team --days 60           # preview
+  dotclaude clean team --days 60 --force   # actually delete
+EOF
+;;
+    shellenv) cat <<'EOF'
+Prints shell code: a claude() wrapper implementing project bindings and the
+global route, plus an optional short alias. Add to ~/.zshrc:
+
+  eval "$(dotclaude shellenv --alias dc)"
+
+Only shells that sourced it are affected — scripts and other tools calling
+the claude binary directly should use `dotclaude run <name>` instead.
+EOF
+;;
+    help) cat <<'EOF'
+With no argument, shows the command overview. With a command name, shows
+detailed help for it. `dotclaude <command> --help` is equivalent.
+EOF
+;;
+    version) cat <<'EOF'
+Prints the dotclaude version.
+EOF
+;;
+  esac
+}
+
+cmd_help() {
+  local topic="${1:-}"
+  if [ -z "$topic" ]; then usage; return; fi
+  local line
+  line="$(commands_table | grep "^${topic}\^" || true)"
+  [ -n "$line" ] || die "unknown command: $topic (see: dotclaude help)"
+  printf 'Usage: dotclaude %s %s\n' "$topic" "$(printf '%s' "$line" | cut -d'^' -f2)"
+  printf '  %s\n\n' "$(printf '%s' "$line" | cut -d'^' -f3)"
+  help_detail "$topic"
 }
 
 # ---------- helpers ----------
@@ -482,6 +619,14 @@ EOF
 main() {
   local cmd="${1:-help}"
   [ $# -gt 0 ] && shift
+  case "${1:-}" in
+    -h|--help)
+      case "$cmd" in
+        help|version|-v|--version|-h|--help) ;;
+        *) cmd_help "$cmd"; return ;;
+      esac
+      ;;
+  esac
   case "$cmd" in
     setup)          cmd_setup "$@" ;;
     run)            cmd_run "$@" ;;
@@ -497,7 +642,7 @@ main() {
     clean)          cmd_clean "$@" ;;
     shellenv)       cmd_shellenv "$@" ;;
     version|-v|--version) echo "dotclaude $VERSION" ;;
-    help|-h|--help) usage ;;
+    help|-h|--help) cmd_help "$@" ;;
     *)              die "unknown command: $cmd (see: dotclaude help)" ;;
   esac
 }

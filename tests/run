@@ -189,7 +189,7 @@ s10_wrapper_works_in_zsh() {
 
 s7_share_rejects_non_whitelist() {
   mk_profile team
-  for item in .credentials.json .claude.json history.jsonl sessions todos; do
+  for item in .credentials.json .claude.json history.jsonl sessions todos settings.local.json; do
     run_dc share team "$item"
     assert_status 1
     assert_contains "not shareable"
@@ -201,6 +201,50 @@ s7_share_default_set_excludes_projects() {
   run_dc share team
   assert_status 0
   [ ! -L "$DOTCLAUDE_HOME/profiles/team/projects" ] || fail_now "bare share must not link projects"
+}
+s7_share_default_set_includes_plugins() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/plugins/marketplaces/mkt"
+  mkdir -p "$DOTCLAUDE_HOME/profiles/team/plugins"
+  echo own > "$DOTCLAUDE_HOME/profiles/team/plugins/known_marketplaces.json"
+  run_dc share team
+  assert_status 0
+  assert_symlink "$DOTCLAUDE_HOME/profiles/team/plugins"
+  assert_file "$DOTCLAUDE_HOME/profiles/team/plugins.bak/known_marketplaces.json"
+  # the profile's own store is backed up whole, never merged into the shared one
+  assert_no_file "$HOME/.claude/plugins/known_marketplaces.json"
+  run_dc unshare team plugins
+  [ ! -L "$DOTCLAUDE_HOME/profiles/team/plugins" ] || fail_now "symlink not removed"
+  assert_file "$DOTCLAUDE_HOME/profiles/team/plugins/known_marketplaces.json"
+}
+s7_share_default_set_includes_settings_and_hooks() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/hooks"; echo '#!/bin/sh' > "$HOME/.claude/hooks/pre.sh"
+  echo '{"theme":"dark"}' > "$HOME/.claude/settings.json"
+  echo '{"theme":"light"}' > "$DOTCLAUDE_HOME/profiles/team/settings.json"
+  run_dc share team
+  assert_status 0
+  assert_symlink "$DOTCLAUDE_HOME/profiles/team/settings.json"
+  assert_symlink "$DOTCLAUDE_HOME/profiles/team/hooks"
+  assert_file "$DOTCLAUDE_HOME/profiles/team/settings.json.bak"
+  [ "$(cat "$DOTCLAUDE_HOME/profiles/team/settings.json")" = '{"theme":"dark"}' ] || fail_now "profile does not see shared settings"
+  # keybindings.json is in the default set but absent here: skipped, not fatal
+  assert_contains "skip keybindings.json"
+  run_dc unshare team
+  assert_status 0
+  [ "$(cat "$DOTCLAUDE_HOME/profiles/team/settings.json")" = '{"theme":"light"}' ] || fail_now "own settings not restored"
+}
+s7_share_refuses_stale_bak_for_any_item() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/agents"
+  mkdir -p "$DOTCLAUDE_HOME/profiles/team/agents" "$DOTCLAUDE_HOME/profiles/team/agents.bak"
+  echo keep > "$DOTCLAUDE_HOME/profiles/team/agents/a.md"
+  run_dc share team agents
+  assert_status 1
+  assert_contains "already exists"
+  # nothing moved: no nesting inside the stale backup
+  assert_file "$DOTCLAUDE_HOME/profiles/team/agents/a.md"
+  assert_no_file "$DOTCLAUDE_HOME/profiles/team/agents.bak/agents/a.md"
 }
 s7_share_projects_merges_and_links() {
   mk_profile team
@@ -476,73 +520,7 @@ s13_usage_all_profiles() {
   assert_contains "fresh"
   assert_contains "not live"
 }
-mk_usage_cache_future() { # like mk_usage_cache but resets_at in the future
-  local in2h in3d
-  in2h="$(python3 -c 'import datetime as d;print((d.datetime.now(d.timezone.utc)+d.timedelta(hours=2)).isoformat())')"
-  in3d="$(python3 -c 'import datetime as d;print((d.datetime.now(d.timezone.utc)+d.timedelta(days=3)).isoformat())')"
-  cat > "$DOTCLAUDE_HOME/profiles/$1/.claude.json" <<EOF
-{"cachedUsageUtilization":{"fetchedAtMs":$(( $(date +%s) * 1000 )),
- "utilization":{
-   "five_hour":{"utilization":44,"resets_at":"$in2h"},
-   "seven_day":{"utilization":33,"resets_at":"$in3d"},
-   "limits":[
-     {"kind":"weekly_scoped","percent":60,"resets_at":"$in3d",
-      "scope":{"model":{"display_name":"Fable"}}}]}}}
-EOF
-}
-s13_timeline_combines_accounts() {
-  mk_profile team; mk_usage_cache_future team
-  mk_profile solo; mk_usage_cache_future solo
-  mk_profile fresh   # no cache -> silently skipped
-  run_dc usage --timeline
-  assert_status 0
-  assert_contains "PROFILE"
-  assert_contains "RESETS IN"
-  assert_contains "team"
-  assert_contains "solo"
-  assert_contains "5h session"
-  assert_contains "weekly (Fable)"
-  assert_contains "56%"   # FREE = 100 - 44
-  assert_contains "40%"   # FREE = 100 - 60
-  assert_contains "cache age:"
-  assert_not_contains "fresh "   # skipped profile contributes no row
-}
-s13_timeline_marks_past_reset_due() {
-  mk_profile team; mk_usage_cache team   # fixed 2026-09 dates; due once passed
-  run_dc usage --timeline
-  assert_status 0
-  assert_contains "5h session"
-}
-s13_timeline_needs_python3() {
-  mk_profile team; mk_usage_cache team
-  mkdir -p "$SB/nojson"
-  local f
-  for f in /usr/bin/*; do ln -s "$f" "$SB/nojson/$(basename "$f")" 2>/dev/null || true; done
-  rm -f "$SB/nojson/python3" "$SB/nojson/jq"
-  local oldpath="$PATH"
-  PATH="$SB/bin:$SB/nojson:/bin"
-  run_dc usage --timeline
-  PATH="$oldpath"
-  assert_status 1
-  assert_contains "python3"
-}
 s13_usage_rejects_unknown_option() { run_dc usage --bogus; assert_status 1; assert_contains "unknown option"; }
-s13_timeline_notice_when_no_cache_at_all() {
-  mk_profile fresh
-  echo '{}' > "$DOTCLAUDE_HOME/profiles/fresh/.claude.json"
-  run_dc usage --timeline
-  assert_status 0
-  assert_contains "No cached usage data"
-}
-s13_timeline_notice_when_no_windows() {
-  mk_profile team   # cache present but carries no window rows
-  printf '{"cachedUsageUtilization":{"fetchedAtMs":%s,"utilization":{}}}\n' "$(( $(date +%s) * 1000 ))" \
-    > "$DOTCLAUDE_HOME/profiles/team/.claude.json"
-  run_dc usage --timeline
-  assert_status 0
-  assert_contains "No cached usage data"
-}
-
 # ---------- S14: keep ----------
 
 s14_keep_sets_retention() {
@@ -562,6 +540,17 @@ s14_keep_preserves_other_settings() {
   assert_contains "was: 30"
   grep -q '"model"' "$DOTCLAUDE_HOME/profiles/team/settings.json" || fail_now "existing setting lost"
   grep -q '365' "$DOTCLAUDE_HOME/profiles/team/settings.json" || fail_now "days not written"
+}
+s14_keep_writes_through_shared_settings() {
+  mk_profile team
+  printf '{"model":"opus"}\n' > "$HOME/.claude/settings.json"
+  run_dc share team settings.json
+  run_dc keep team --days 365
+  assert_status 0
+  assert_contains "settings.json is shared"
+  assert_symlink "$DOTCLAUDE_HOME/profiles/team/settings.json"
+  grep -q '365' "$HOME/.claude/settings.json" || fail_now "days not written to the shared file"
+  grep -q '"model"' "$HOME/.claude/settings.json" || fail_now "existing shared setting lost"
 }
 s14_keep_works_on_default() {
   run_dc keep default
@@ -586,7 +575,7 @@ help_command_names() { # extract command names from `help` output's Commands blo
 s12_help_lists_all_dispatch_commands() {
   run_dc help
   assert_status 0
-  for c in setup run use list current bind unbind share unshare doctor du clean shellenv help version; do
+  for c in setup run use list current bind unbind share unshare items doctor du clean shellenv help version; do
     assert_contains "$c"
   done
 }
@@ -610,6 +599,80 @@ s12_dashdash_help_never_executes() {
   assert_not_contains "fake-claude"
 }
 s12_help_unknown_topic_errors() { run_dc help nope; assert_status 1; assert_contains "unknown command"; }
+
+# ---------- S15: items ----------
+
+mk_items_fixture() { # populate the shared store with one of each item
+  mkdir -p "$HOME/.claude/agents" "$HOME/.claude/commands" \
+           "$HOME/.claude/skills/alpha/vendor/nested" "$HOME/.claude/skills/beta" \
+           "$HOME/.claude/plugins"
+  echo a > "$HOME/.claude/agents/scout.md"
+  echo c > "$HOME/.claude/commands/rams.md"
+  echo s > "$HOME/.claude/skills/alpha/SKILL.md"
+  echo s > "$HOME/.claude/skills/beta/SKILL.md"
+  echo s > "$HOME/.claude/skills/alpha/vendor/nested/SKILL.md"  # vendored: not a skill
+  echo g > "$HOME/.claude/CLAUDE.md"
+  echo '{"version":2,"plugins":{"one@mkt":[{"version":"1.0.0"}],"two@mkt":[{"version":"1.0.0"}]}}' \
+    > "$HOME/.claude/plugins/installed_plugins.json"
+  echo '{"enabledPlugins":{"one@mkt":true,"two@mkt":false}}' > "$HOME/.claude/settings.json"
+}
+s15_items_counts_and_marks_shared() {
+  mk_items_fixture
+  mk_profile team
+  run_dc share team
+  run_dc items
+  assert_status 0
+  assert_contains "agents            1"
+  assert_contains "skills            2"        # the vendored SKILL.md is not a skill
+  assert_contains "commands          1"
+  assert_contains "shared"
+  assert_contains "hooks             0"
+  assert_contains "settings.json     present"
+  # settings.json is in the default set, so plugin enablement follows it
+  assert_contains "2 installed, 1 on"    # default
+  assert_not_contains "2 installed, 0 on"
+}
+s15_items_own_settings_keep_own_enablement() {
+  mk_items_fixture
+  mk_profile team
+  run_dc share team plugins
+  run_dc items
+  assert_status 0
+  assert_contains "2 installed, 1 on"    # default
+  assert_contains "2 installed, 0 on"    # team, same store, own settings
+}
+s15_items_names_lists_skills_and_plugins() {
+  mk_items_fixture
+  mk_profile team
+  run_dc share team
+  run_dc items team --names
+  assert_status 0
+  assert_contains "alpha"
+  assert_contains "beta"
+  assert_contains "two@mkt(off)"         # shared settings: same enablement as default
+  assert_not_contains "one@mkt(off)"
+  assert_not_contains "vendor/nested"
+}
+s15_items_flags_broken_share_link() {
+  mk_profile team
+  mkdir -p "$HOME/.claude/agents"
+  run_dc share team agents
+  rm -rf "$HOME/.claude/agents"
+  run_dc items team
+  assert_status 0
+  assert_contains "BROKEN LINK"
+}
+s15_items_own_copies_are_marked() {
+  mk_profile team
+  mkdir -p "$DOTCLAUDE_HOME/profiles/team/skills/solo"
+  echo s > "$DOTCLAUDE_HOME/profiles/team/skills/solo/SKILL.md"
+  run_dc items team
+  assert_status 0
+  assert_contains "skills            1"
+  assert_contains "own"
+}
+s15_items_rejects_unknown_profile()  { run_dc items nope; assert_status 1; }
+s15_items_rejects_unknown_option()   { run_dc items --bogus; assert_status 1; assert_contains "unknown option"; }
 
 # ---------- run all ----------
 
@@ -642,6 +705,9 @@ t "S7 share rejects non-whitelist items"       s7_share_rejects_non_whitelist
 t "S7 share links items, backs up files"       s7_share_links_and_backs_up
 t "S7 share refuses default"                   s7_share_refuses_default
 t "S7 bare share excludes projects"            s7_share_default_set_excludes_projects
+t "S7 bare share includes plugins"             s7_share_default_set_includes_plugins
+t "S7 bare share includes settings and hooks"  s7_share_default_set_includes_settings_and_hooks
+t "S7 share refuses stale .bak for any item"   s7_share_refuses_stale_bak_for_any_item
 t "S7 share projects merges and links"         s7_share_projects_merges_and_links
 t "S7 failed merge leaves profile untouched"   s7_share_projects_failed_merge_leaves_profile
 t "S7 share projects refuses foreign symlink"  s7_share_projects_refuses_foreign_symlink
@@ -657,6 +723,7 @@ t "S8 clean rejects non-numeric --days"        s8_clean_rejects_bad_days
 t "S8 clean unknown profile errors"            s8_clean_unknown_profile
 t "S14 keep sets cleanupPeriodDays"            s14_keep_sets_retention
 t "S14 keep preserves other settings"          s14_keep_preserves_other_settings
+t "S14 keep writes through shared settings"    s14_keep_writes_through_shared_settings
 t "S14 keep works on default profile"          s14_keep_works_on_default
 t "S14 keep rejects bad --days"                s14_keep_rejects_bad_days
 t "S14 keep refuses --days 0 (write bug)"      s14_keep_refuses_zero_days
@@ -665,12 +732,7 @@ t "S13 usage shows 5h/weekly/scoped windows"   s13_usage_shows_windows
 t "S13 usage notice when no cache"             s13_usage_no_cache_notice
 t "S13 usage unknown profile errors"           s13_usage_unknown_profile_errors
 t "S13 usage covers all profiles"              s13_usage_all_profiles
-t "S13 timeline combines accounts"             s13_timeline_combines_accounts
-t "S13 timeline renders fixed-date cache"      s13_timeline_marks_past_reset_due
-t "S13 timeline needs python3"                 s13_timeline_needs_python3
 t "S13 usage rejects unknown option"           s13_usage_rejects_unknown_option
-t "S13 timeline notice when no cache"          s13_timeline_notice_when_no_cache_at_all
-t "S13 timeline notice when no windows"        s13_timeline_notice_when_no_windows
 t "S12 help lists every command"               s12_help_lists_all_dispatch_commands
 t "S12 every listed command has topic help"    s12_every_listed_command_has_topic_help
 t "S12 --help never executes the command"      s12_dashdash_help_never_executes
@@ -683,6 +745,13 @@ t "S9 doctor ok when retention set"            s9_doctor_ok_when_retention_set
 t "S9 doctor sees share before first launch"   s9_doctor_reports_share_before_first_launch
 t "S9 doctor skips retention w/o json tools"   s9_doctor_skips_cleanup_check_without_json_tools
 t "S9 du marks shared sessions"                s9_du_marks_shared_sessions
+t "S15 items counts and marks shared"          s15_items_counts_and_marks_shared
+t "S15 items --names lists skills/plugins"     s15_items_names_lists_skills_and_plugins
+t "S15 items: own settings, own enablement"    s15_items_own_settings_keep_own_enablement
+t "S15 items flags a broken share link"        s15_items_flags_broken_share_link
+t "S15 items marks a profile's own copies"     s15_items_own_copies_are_marked
+t "S15 items rejects unknown profile"          s15_items_rejects_unknown_profile
+t "S15 items rejects unknown option"           s15_items_rejects_unknown_option
 
 echo
 echo "passed: $PASS  failed: $FAIL"

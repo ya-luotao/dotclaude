@@ -67,18 +67,42 @@ fall through to another account.
 ## S7. `share` / `unshare` — config sharing
 
 - Shareable items are a **hardcoded whitelist**: `agents`, `skills`,
-  `commands`, `CLAUDE.md`, plus `projects` (session transcripts) as a
-  **strictly opt-in** item — in the whitelist but never in the default set,
-  so `share <name>` without items links only the four config items.
+  `commands`, `plugins`, `hooks`, `settings.json`, `keybindings.json`,
+  `CLAUDE.md`, plus `projects` (session transcripts) as a **strictly
+  opt-in** item — in the whitelist but never in the default set, so
+  `share <name>` without items links every config item and nothing else.
   Requesting anything else is an error — in particular `.credentials.json`,
   `.claude.json`, `history.jsonl`, `todos` must never become shareable,
-  because sharing them breaks account isolation. (Sharing `projects` merges
+  because sharing them breaks account isolation. `settings.local.json` is
+  not shareable either: it exists to hold per-machine, per-profile
+  overrides. (Sharing `projects` merges
   session history across accounts deliberately; the caveats are printed and
   documented, and the ToS note in the README applies.)
 - `share` symlinks items from `~/.claude/<item>` into the profile. A source
   that doesn't exist is skipped with a notice — except `projects`, whose
   source directory is created. An existing non-symlink destination is
-  preserved as `<item>.bak` before linking.
+  preserved as `<item>.bak` before linking; if a `<item>.bak` is already
+  there, `share` refuses that item rather than moving a directory inside its
+  own stale backup or discarding an older file backup.
+- `plugins` (the whole plugin store: marketplaces, installed plugins, their
+  cache) is part of the **default** set: what is installed is machine-level
+  rather than account-level, and the store runs to hundreds of megabytes.
+  The consequence, documented in `help share`, is that installing or
+  removing a plugin (or adding a marketplace) in one sharing profile does it
+  for all of them. Plugin **enablement** (`enabledPlugins`) lives in
+  `settings.json`, so it is shared exactly when `settings.json` is: with
+  the default set both are linked and every profile enables the same
+  plugins; a profile that keeps its own `settings.json` can enable a
+  different subset. Unlike `projects`, a profile's existing `plugins`
+  directory is **not** merged into the shared store — it is kept whole at
+  `plugins.bak` and restored by `unshare`.
+- `settings.json` is part of the **default** set: model, theme,
+  permissions, hook configuration, `enabledPlugins` and `cleanupPeriodDays`
+  are machine-level preferences, not account-level ones, and the user wants
+  one set of them everywhere. A profile's own `settings.json` is kept as
+  `settings.json.bak`, never merged. Because dotclaude itself edits this
+  file (`keep`, S14), it must write **through** the symlink: replacing the
+  link with a private copy would silently unshare the item.
 - Sharing `projects` first **merges** the profile's existing transcripts
   into `~/.claude/projects`: files already present in the shared store are
   never overwritten, and the merge completes before anything moves aside, so
@@ -172,15 +196,7 @@ directly and get the default account unless they use `dotclaude run` or set
   a crash.
 - A profile without cached data gets a notice (exit 0); an unknown profile
   name is an error. Requires `jq` or `python3`.
-- `usage --timeline` (optionally with a profile name) renders all selected
-  profiles' windows on one time axis, sorted soonest reset first, each row
-  showing FREE (100 − utilization, as of that profile's cache fetch), time
-  until reset, and a bar proportional to remaining time, plus per-profile
-  cache age. A window whose reset already passed shows `due` and is marked
-  stale rather than guessed at. Profiles without cached data are skipped;
-  none at all yields a notice (exit 0). The timeline requires `python3`
-  (timestamp math) — without it, an error. Unknown options are errors. The
-  no-network / no-credentials guarantee above applies unchanged.
+- Unknown options are errors.
 
 ## S14. `keep <name> [--days N]` — session retention
 
@@ -190,7 +206,38 @@ directly and get the default account unless they use `dotclaude run` or set
 - The merge is surgical: every other key in `settings.json` is preserved,
   and the file is created if missing. A failed merge leaves the original
   file untouched.
+- A shared `settings.json` (a symlink, S7) is followed: the value lands in
+  the real file and the symlink survives, so the setting applies to every
+  profile sharing that file — and `keep` says so.
 - `--days 0` is refused: a known Claude Code bug makes `cleanupPeriodDays: 0`
   disable transcript writing entirely rather than disabling cleanup.
 - Non-numeric `--days` and unknown profiles are errors. Requires `jq` or
   `python3`.
+
+## S15. `items [name] [--names]` — per-profile config inventory
+
+- For each profile (all of them, or the one named), prints how much of each
+  shareable config item it has: `agents`, `skills`, `commands` and `hooks`
+  counts (hooks: files at any depth), plugins as `N installed, M on`, and
+  whether `settings.json`, `keybindings.json` and a global `CLAUDE.md` are
+  present — plus a state column per item.
+- Counting rules: agents and commands are `*.md` files at any depth
+  (commands nest legitimately — `commands/<dir>/<name>.md` is namespaced);
+  a **skill** is exactly `skills/<name>/SKILL.md`, so a `SKILL.md` deeper
+  inside a skill (a vendored checkout) is not counted as another skill.
+  Counts follow share symlinks.
+- State per item: nothing for the `default` profile (it is the share
+  source), `shared` when the item symlinks to `~/.claude/<item>`,
+  `shared (BROKEN LINK)` when that source is gone, `-> <target>` for a
+  symlink pointing elsewhere, `own` for a real file or directory, and
+  nothing when the item is absent.
+- `N installed` comes from the profile's
+  `plugins/installed_plugins.json`; `M on` from `enabledPlugins` in its
+  `settings.json`. Profiles on one shared plugin store that keep their own
+  `settings.json` legitimately show different `on` counts (S7).
+- `--names` additionally spells out the skill, agent, command and plugin
+  names, wrapped; a plugin that is installed but not enabled in that profile
+  is suffixed `(off)`.
+- Without `jq` or `python3` the plugin counts degrade to zero rather than
+  erroring, matching `list` (S9). An unknown profile name and an unknown
+  option are errors.

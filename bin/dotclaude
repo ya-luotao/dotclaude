@@ -3,16 +3,19 @@
 # https://github.com/ya-luotao/dotclaude
 set -euo pipefail
 
-VERSION="0.7.0"
+VERSION="0.9.0"
 DOTCLAUDE_HOME="${DOTCLAUDE_HOME:-$HOME/.dotclaude}"
 PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
 
 # Items that may be shared (symlinked) between profiles. Credentials and
 # history are deliberately excluded and can never be added via arguments.
+# `plugins` is in the default set: marketplaces and installed plugins are
+# machine-level, not account-level, and the store is large (hundreds of MB)
+# — one copy per profile is pure waste.
 # `projects` (session transcripts) is shareable but strictly opt-in: never
 # part of the default set, because it merges session history across accounts.
-SHARE_WHITELIST="agents skills commands CLAUDE.md projects"
-SHARE_DEFAULT="agents skills commands CLAUDE.md"
+SHARE_WHITELIST="agents skills commands plugins hooks settings.json keybindings.json CLAUDE.md projects"
+SHARE_DEFAULT="agents skills commands plugins hooks settings.json keybindings.json CLAUDE.md"
 NEVER_SHARE=".credentials.json .claude.json history.jsonl todos sessions cache"
 
 err()  { printf 'dotclaude: %s\n' "$*" >&2; }
@@ -33,8 +36,9 @@ bind^<name> [dir]^Bind a project directory to a profile (.dotclaude file)
 unbind^[dir]^Remove a project binding
 share^<name> [items...]^Symlink shared config from ~/.claude into a profile
 unshare^<name> [items...]^Remove shared symlinks (restores .bak if present)
+items^[name] [--names]^List each profile's agents, skills, commands and plugins
 doctor^^Check for common multi-account pitfalls
-usage^[name] [--timeline]^Show cached 5h/weekly rate-limit usage per profile
+usage^[name]^Show cached 5h/weekly rate-limit usage per profile
 du^^Disk usage per profile
 clean^<name> [--days N] [--force]^Delete old session transcripts (dry-run unless --force)
 keep^<name> [--days N]^Retain sessions ~forever (sets cleanupPeriodDays, default 999999)
@@ -125,9 +129,24 @@ EOF
     share) cat <<'EOF'
 Symlinks items from ~/.claude into the profile so both accounts see the same
 config. Shareable items (hardcoded whitelist): agents skills commands
-CLAUDE.md projects. Credentials, history, and .claude.json can never be
-shared — that would break account isolation. An existing real file is
-preserved as <item>.bak.
+plugins hooks settings.json keybindings.json CLAUDE.md projects. Credentials,
+history, and .claude.json can never be shared — that would break account
+isolation. An existing real file or directory is preserved as <item>.bak.
+
+`settings.json` (model, theme, permissions, hooks config, enabledPlugins,
+cleanupPeriodDays) is shared by default, so every sharing profile runs on
+one settings file: change a setting in one and all of them follow. Only
+settings.local.json stays per-profile. A profile that had its own
+settings.json keeps it at settings.json.bak; unshare puts it back.
+
+`plugins` shares the whole plugin store — marketplaces, installed plugins,
+and their cache (typically hundreds of MB, so one copy instead of one per
+profile). It is shared by default: what you install is machine-level, not
+account-level. Installing or removing a plugin, or adding a marketplace,
+then does it for every sharing profile. Which plugins are *enabled* lives
+in settings.json, so it is shared exactly when settings.json is; `dotclaude
+items` shows both. A profile that already has its own plugins keeps them at
+plugins.bak; they are not merged into the shared store.
 
 `projects` (session transcripts) is opt-in only — never included when items
 are omitted, because it merges session history across accounts. Sharing it
@@ -137,8 +156,10 @@ profile sees and resumes the same sessions — project memory included. Set a
 retention horizon on EVERY participating profile (dotclaude keep <name>),
 or one profile's 30-day default cleanup will prune the shared store.
 
-  dotclaude share team                  # link the four config items
+  dotclaude share team                  # link every config item
   dotclaude share team agents CLAUDE.md
+  dotclaude share team agents skills commands plugins hooks CLAUDE.md
+                                        # everything except settings.json
   dotclaude share team projects         # opt in to shared sessions
 EOF
 ;;
@@ -147,6 +168,25 @@ Removes shared symlinks (only symlinks — a real file is never deleted) and
 restores <item>.bak if one exists. Like share, `projects` must be named
 explicitly; unsharing it restores the pre-share transcripts, while
 transcripts created during sharing remain in ~/.claude/projects.
+EOF
+;;
+    items) cat <<'EOF'
+Lists, per profile, what config it actually has: how many agents, skills,
+commands and hook scripts it can load, how many plugins are installed and
+how many of those are enabled, and whether it has a settings.json,
+keybindings.json and global CLAUDE.md — with a state column saying whether
+each item is the profile's own copy or shared (symlinked) from ~/.claude. A
+symlink pointing anywhere else is shown as its target, and a shared item
+whose source is gone is flagged BROKEN LINK (also see: doctor).
+
+Plugin enable/disable lives in settings.json, so it is shared only when
+settings.json is: two profiles on one shared plugin store with their own
+settings can differ in what is enabled — the "N installed, M on" counts
+show that.
+
+  dotclaude items               # every profile, counts only
+  dotclaude items team          # one profile
+  dotclaude items team --names  # spell out the skill and plugin names
 EOF
 ;;
     doctor) cat <<'EOF'
@@ -167,16 +207,8 @@ refreshes while claude runs; there is no official CLI or API for these
 numbers, so this relies on an undocumented format and may break with Claude
 Code updates. The /usage command inside claude is the authoritative view.
 
---timeline renders every profile's windows on one time axis, soonest reset
-first: FREE (100 − utilization, as of each profile's cache fetch), time
-until reset, and a bar proportional to the remaining time — one glance
-answers "which account has capacity now, and when does each window come
-back". A window whose reset already passed shows `due` (the cache predates
-the reset, so the window is likely fresh). Needs python3.
-
   dotclaude usage               # all profiles
   dotclaude usage team          # one profile
-  dotclaude usage --timeline    # all accounts on one reset-time axis
 EOF
 ;;
     du) cat <<'EOF'
@@ -202,10 +234,13 @@ EOF
 Stops Claude Code from auto-deleting this profile's session transcripts by
 setting cleanupPeriodDays in the profile's settings.json (default here:
 999999 days ≈ forever; Claude Code's own default is 30). Other settings in
-the file are preserved. --days 0 is refused: a known Claude Code bug makes 0
-disable transcript writing entirely instead of disabling cleanup. Note:
-retained sessions add up — see `dotclaude du`, and use `dotclaude clean`
-when you want to prune manually.
+the file are preserved. When the profile's settings.json is shared (see:
+dotclaude help share) the value is written through the link, so it applies
+to every profile sharing that file — the link itself is left intact.
+--days 0 is refused: a known Claude Code bug makes 0 disable transcript
+writing entirely instead of disabling cleanup. Note: retained sessions add
+up — see `dotclaude du`, and use `dotclaude clean` when you want to prune
+manually.
 
   dotclaude keep default          # keep your main login's sessions forever
   dotclaude keep team --days 365  # or pick a horizon
@@ -544,8 +579,11 @@ cmd_share() {
       [ "$(readlink "$dst")" = "$src" ] && { echo "ok   $item (already shared)"; continue; }
       rm "$dst"
     elif [ -e "$dst" ]; then
+      # same hazard as projects: mv would nest a directory into its own stale
+      # backup, and would silently discard an older file backup
+      [ -e "$dst.bak" ] && die "$dst.bak already exists (interrupted earlier share?) — resolve the stale backup first"
       mv "$dst" "$dst.bak"
-      echo "note $item: existing file moved to $dst.bak"
+      echo "note $item: existing $( [ -d "$dst.bak" ] && echo directory || echo file ) moved to $dst.bak"
     fi
     ln -s "$src" "$dst"
     echo "link $item -> $src"
@@ -573,6 +611,157 @@ cmd_unshare() {
       err "skip $item: not a shared symlink"
     fi
   done
+}
+
+# ---------- items: what config each profile actually has ----------
+
+# json_keys FILE PATH — object keys, one per line (empty when unreadable)
+json_keys() {
+  local file="$1" path="$2"
+  [ -f "$file" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -r "($path // {}) | keys[]?" "$file" 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" "$path" 0 <<'PY' 2>/dev/null
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+for k in sys.argv[2].lstrip('.').split('.'):
+    if not isinstance(d, dict) or k not in d: sys.exit(0)
+    d = d[k]
+if isinstance(d, dict):
+    for k in sorted(d):
+        if sys.argv[3] == "0" or d[k]: print(k)
+PY
+  fi
+}
+
+# json_true_keys FILE PATH — keys whose value is truthy (e.g. enabledPlugins)
+json_true_keys() {
+  local file="$1" path="$2"
+  [ -f "$file" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -r "($path // {}) | to_entries[] | select(.value) | .key" "$file" 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" "$path" 1 <<'PY' 2>/dev/null
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+for k in sys.argv[2].lstrip('.').split('.'):
+    if not isinstance(d, dict) or k not in d: sys.exit(0)
+    d = d[k]
+if isinstance(d, dict):
+    for k in sorted(d):
+        if sys.argv[3] == "0" or d[k]: print(k)
+PY
+  fi
+}
+
+# item_state PATH ITEM — how a named profile holds this item (the default
+# profile is the share source, so its own copies need no annotation)
+item_state() {
+  local dst="$1" target
+  if [ -L "$dst" ]; then
+    target="$(readlink "$dst")"
+    if [ "$target" = "$HOME/.claude/$2" ]; then
+      [ -e "$dst" ] && echo shared || echo "shared (BROKEN LINK)"
+    else
+      echo "-> $target"
+    fi
+  elif [ -e "$dst" ]; then
+    echo own
+  fi
+}
+
+# md_names DIR MARKER — skill/agent/command names under DIR, one per line.
+# Skills are exactly skills/<name>/SKILL.md: a deeper match belongs to a
+# checkout vendored inside a skill, not to another skill. Agents and commands
+# nest legitimately (commands/<dir>/<name>.md is a namespaced command).
+md_names() {
+  local dir="$1" marker="$2" f rel depth=""
+  [ -d "$dir" ] || return 0
+  [ "$marker" = "SKILL.md" ] && depth="-mindepth 2 -maxdepth 2"
+  # shellcheck disable=SC2086 -- depth is a deliberate two-flag word split
+  find -L "$dir" $depth -type f -name "$marker" 2>/dev/null | sort | while IFS= read -r f; do
+    rel="${f#"$dir"/}"
+    if [ "$marker" = "SKILL.md" ]; then rel="${rel%/SKILL.md}"; else rel="${rel%.md}"; fi
+    printf '%s\n' "$rel"
+  done
+}
+
+# names_block — wrap a name list from stdin into an indented paragraph
+names_block() { tr '\n' ' ' | fold -s -w 68 | sed -e 's/^/      /' -e 's/ *$//' | grep -v '^ *$' || true; }
+
+# blank for the default profile, item_state for the rest
+profile_item_state() {
+  [ "$1" = "default" ] && return 0
+  item_state "$2" "$3"
+}
+
+items_line() {
+  if [ -n "$3" ]; then printf '  %-17s %-22s %s\n' "$1" "$2" "$3"
+  else printf '  %-17s %s\n' "$1" "$2"; fi
+}
+
+cmd_items() {
+  local names="" show_names=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --names) show_names=1 ;;
+      -*) die "unknown option: $arg" ;;
+      *) names="$arg" ;;
+    esac
+  done
+  if [ -n "$names" ]; then require_profile "$names"; else names="$(all_profiles)"; fi
+
+  local name dir item first=1 n installed enabled non_default=0
+  for name in $names; do
+    [ "$first" -eq 1 ] || echo
+    first=0
+    dir="$(profile_dir "$name")"
+    [ "$name" = "default" ] || non_default=1
+    echo "$(bold "$name")  $dir"
+
+    for item in agents skills commands; do
+      if [ "$item" = "skills" ]; then
+        n="$(md_names "$dir/skills" SKILL.md | wc -l | tr -d ' ')"
+      else
+        n="$(md_names "$dir/$item" '*.md' | wc -l | tr -d ' ')"
+      fi
+      items_line "$item" "$n" "$(profile_item_state "$name" "$dir/$item" "$item")"
+      if [ "$show_names" -eq 1 ] && [ "$n" != "0" ]; then
+        if [ "$item" = "skills" ]; then md_names "$dir/skills" SKILL.md | names_block
+        else md_names "$dir/$item" '*.md' | names_block; fi
+      fi
+    done
+
+    installed="$(json_keys "$dir/plugins/installed_plugins.json" .plugins)"
+    enabled="$(json_true_keys "$dir/settings.json" .enabledPlugins)"
+    n="$(printf '%s' "$installed" | grep -c . || true)"
+    items_line plugins "$n installed, $(printf '%s' "$enabled" | grep -c . || true) on" \
+      "$(profile_item_state "$name" "$dir/plugins" plugins)"
+    if [ "$show_names" -eq 1 ] && [ -n "$installed" ]; then
+      printf '%s\n' "$installed" | while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if printf '%s\n' "$enabled" | grep -qxF "$p"; then printf '%s\n' "$p"; else printf '%s(off)\n' "$p"; fi
+      done | names_block
+    fi
+
+    n=0
+    [ -d "$dir/hooks" ] && n="$(find -L "$dir/hooks" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    items_line hooks "$n" "$(profile_item_state "$name" "$dir/hooks" hooks)"
+
+    for item in settings.json keybindings.json CLAUDE.md; do
+      items_line "$item" "$( [ -e "$dir/$item" ] && echo present || echo -)" \
+        "$(profile_item_state "$name" "$dir/$item" "$item")"
+    done
+  done
+
+  if [ "$non_default" -eq 1 ]; then
+    echo
+    echo "\"shared\" = symlinked to ~/.claude (see: dotclaude share). Plugin on/off lives"
+    echo "in settings.json, so it is shared exactly when settings.json is."
+  fi
 }
 
 cmd_doctor() {
@@ -719,95 +908,15 @@ usage_bar() { # percent -> [########------------]
   printf '[%s]' "$out"
 }
 
-# Waterfall view: every profile's windows on one time axis, soonest reset
-# first — answers "which account has capacity right now, and when does each
-# window come back". Needs python3 for ISO timestamp math.
-usage_timeline() {
-  command -v python3 >/dev/null 2>&1 || die "usage --timeline needs python3"
-  local name rows all=""
-  for name in $1; do
-    rows="$(usage_rows "$(config_json "$name")")" || true
-    [ -n "$rows" ] || continue
-    all="$all$(printf '%s\n' "$rows" | awk -F'\t' -v p="$name" '
-      $1=="fetched" {print p"\tfetched\t"$2}
-      $1!="fetched" {print p"\t"$1"\t"$2"\t"$3}')
-"
-  done
-  [ -n "$all" ] || { echo "No cached usage data in any profile (launch claude once per profile)."; return 0; }
-  # data goes via env: stdin already carries the program for `python3 -`
-  DOTCLAUDE_TL_ROWS="$all" python3 - <<'PY'
-import datetime, os, sys
-
-def human(td, floor="due"):
-    s = int(td.total_seconds())
-    if s <= 0:
-        return floor
-    d, s = divmod(s, 86400)
-    h, s = divmod(s, 3600)
-    m = s // 60
-    if d: return "%dd%02dh" % (d, h)
-    if h: return "%dh%02dm" % (h, m)
-    return "%dm" % m
-
-now = datetime.datetime.now(datetime.timezone.utc)
-rows, fetched = [], {}
-for line in os.environ.get("DOTCLAUDE_TL_ROWS", "").splitlines():
-    parts = line.split("\t")
-    if len(parts) < 3:
-        continue
-    prof, label = parts[0], parts[1]
-    if label == "fetched":
-        try:
-            ms = int(parts[2])
-        except ValueError:
-            continue
-        if ms:
-            fetched[prof] = human(now - datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc), floor="0m")
-        continue
-    if len(parts) < 4 or not parts[3]:
-        continue
-    try:
-        pct = round(float(parts[2]))
-        dt = datetime.datetime.fromisoformat(parts[3])
-    except ValueError:
-        continue
-    rows.append((prof, label, pct, dt))
-
-if not rows:
-    print("No cached usage data in any profile (launch claude once per profile).")
-    sys.exit(0)
-
-rows.sort(key=lambda r: r[3])
-W = 34
-maxrem = max((dt - now).total_seconds() for _, _, _, dt in rows)
-axis = "now " + "-" * (W - 2) + "> " + human(rows[-1][3] - now, floor="due")
-print("%-10s %-17s %5s  %-9s %s" % ("PROFILE", "WINDOW", "FREE", "RESETS IN", axis))
-for prof, label, pct, dt in rows:
-    rem = (dt - now).total_seconds()
-    n = 0 if rem <= 0 or maxrem <= 0 else max(1, round(W * rem / maxrem))
-    note = "  (past reset — cache stale, window likely fresh)" if rem <= 0 else ""
-    print("%-10s %-17s %4d%%  %-9s %s%s" % (prof, label, max(0, 100 - pct), human(dt - now), "#" * n, note))
-if fetched:
-    print()
-    print("cache age: " + ", ".join("%s %s" % kv for kv in fetched.items())
-          + " — FREE is as of fetch; bars show time until reset")
-PY
-}
-
 cmd_usage() {
-  local names="" name rows fetched_ms age_min now_s timeline=0 arg
+  local names="" name rows fetched_ms age_min now_s arg
   for arg in "$@"; do
     case "$arg" in
-      --timeline) timeline=1 ;;
       -*) die "unknown option: $arg" ;;
       *) names="$arg" ;;
     esac
   done
   if [ -n "$names" ]; then require_profile "$names"; else names="$(all_profiles)"; fi
-  if [ "$timeline" -eq 1 ]; then
-    usage_timeline "$names"
-    return
-  fi
   now_s="$(date +%s)"
   for name in $names; do
     rows="$(usage_rows "$(config_json "$name")")" || return 1
@@ -890,10 +999,24 @@ cmd_clean() {
   fi
 }
 
+# resolve_link PATH — follow symlinks to the real file. A shared
+# settings.json is a symlink into ~/.claude; writing via rename onto the
+# link would silently replace it with a private copy and unshare the item.
+resolve_link() {
+  local p="$1" t
+  while [ -L "$p" ]; do
+    t="$(readlink "$p")"
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+  done
+  printf '%s\n' "$p"
+}
+
 # settings_json_set FILE KEY NUM — merge one numeric key into a JSON settings
-# file, preserving everything else. Creates the file if missing.
+# file, preserving everything else. Creates the file if missing. Symlinks
+# are followed so the rename lands on the real file (see resolve_link).
 settings_json_set() {
-  local file="$1" key="$2" val="$3" tmp
+  local file key="$2" val="$3" tmp
+  file="$(resolve_link "$1")"
   [ -f "$file" ] || printf '{}\n' > "$file"
   tmp="$file.dotclaude-tmp"
   if command -v jq >/dev/null 2>&1; then
@@ -934,6 +1057,9 @@ cmd_keep() {
   settings_json_set "$file" cleanupPeriodDays "$days" || exit 1
   echo "Set cleanupPeriodDays=${days} for profile '$name' (was: ${old:-unset, default 30})"
   echo "Claude Code will now retain this profile's session transcripts for ${days} days."
+  if [ -L "$file" ]; then
+    echo "note settings.json is shared ($(readlink "$file")) — this applies to every profile sharing it."
+  fi
 }
 
 cmd_shellenv() {
@@ -1004,6 +1130,7 @@ main() {
     unbind)         cmd_unbind "$@" ;;
     share)          cmd_share "$@" ;;
     unshare)        cmd_unshare "$@" ;;
+    items)          cmd_items "$@" ;;
     doctor)         cmd_doctor "$@" ;;
     usage)          cmd_usage "$@" ;;
     du)             cmd_du "$@" ;;

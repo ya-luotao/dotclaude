@@ -85,18 +85,69 @@ from `$PWD` looking for a `.dotclaude` file. An explicitly set
 
 ### Sharing config between profiles
 
-Your agents, skills, commands, and global `CLAUDE.md` are usually
-account-independent. Share them from `~/.claude` into a profile via symlinks:
+Your agents, skills, commands, plugins, hooks, settings, keybindings, and
+global `CLAUDE.md` are usually account-independent. Share them from
+`~/.claude` into a profile via symlinks:
 
 ```sh
-dotclaude share team                      # links agents/ skills/ commands/ CLAUDE.md
+dotclaude share team                      # links agents/ skills/ commands/ plugins/ hooks/
+                                          #   settings.json keybindings.json CLAUDE.md
 dotclaude share team agents CLAUDE.md     # or pick specific items
 dotclaude unshare team                    # remove links (restores .bak backups)
 ```
 
-Only those four items are shared by default. Credentials, history, and
-`.claude.json` are hardcoded as never-shareable — sharing them would break
-account isolation (see FAQ).
+Those are all the config items, and all are shared by default. Credentials,
+history, `.claude.json` and `settings.local.json` are hardcoded as
+never-shareable — the first three would break account isolation, the last
+exists precisely to hold per-profile overrides (see FAQ).
+
+`settings.json` carries model, theme, permissions, hook configuration,
+which plugins are enabled, and session retention, so sharing it means one
+set of preferences everywhere: change a setting in any profile and all of
+them follow. To keep settings per-profile, name the items you want instead:
+
+```sh
+dotclaude share team agents skills commands plugins hooks CLAUDE.md
+```
+
+`plugins/` is the whole plugin store — marketplaces, installed plugins, and
+their cache, typically hundreds of megabytes, so sharing it also means one
+copy instead of one per profile. The trade-off: installing or removing a
+plugin (or adding a marketplace) in one profile does it for every profile
+sharing the store. Which plugins are *enabled* lives in `settings.json`, so
+it is shared exactly when that file is; profiles that keep their own
+settings can run different subsets. A profile that already had plugins
+keeps its own copy at `plugins.bak` (not merged), and `unshare` puts it
+back.
+
+To see what any profile actually has:
+
+```sh
+dotclaude items                     # every profile: agents/skills/commands/plugins counts
+dotclaude items team --names        # spell out the names, marking disabled plugins
+```
+
+```
+default  /Users/you/.claude
+  agents            7
+  skills            45
+  commands          3
+  plugins           34 installed, 12 on
+  hooks             9
+  settings.json     present
+  keybindings.json  -
+  CLAUDE.md         present
+
+team  /Users/you/.dotclaude/profiles/team
+  agents            7                      shared
+  skills            45                     shared
+  commands          3                      shared
+  plugins           34 installed, 12 on    shared
+  hooks             9                      shared
+  settings.json     present                shared
+  keybindings.json  -
+  CLAUDE.md         present                shared
+```
 
 ### Sharing sessions between profiles (opt-in)
 
@@ -138,8 +189,7 @@ dotclaude du                        # disk usage per profile (sessions get big)
 dotclaude clean team --days 60      # dry-run: what would be deleted
 dotclaude clean team --days 60 --force   # actually delete old transcripts
 dotclaude usage                     # cached 5h/weekly rate-limit windows per profile
-dotclaude usage --timeline          # all accounts on one reset-time axis:
-                                    # FREE %, time to reset, waterfall bars
+dotclaude items                     # what config each profile has, and what's shared
 ```
 
 ## Verify isolation once (recommended)

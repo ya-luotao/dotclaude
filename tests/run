@@ -6,7 +6,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DC="$ROOT/bin/dotclaude"
+DC="${DOTCLAUDE_TEST_BIN:-$ROOT/bin/dotclaude}"   # CI runs the suite against a bash-3.2 copy
 PASS=0; FAIL=0; FAILED_NAMES=""
 
 # ---------- harness ----------
@@ -21,7 +21,7 @@ sandbox() {
   chmod +x "$SB/bin/claude"
   export PATH="$SB/bin:/usr/bin:/bin"
   unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY DOTCLAUDE_WRAPPER 2>/dev/null || true
-  cd "$SB"
+  cd "$SB" || exit 1
 }
 
 mk_profile() { # name [email] [org]
@@ -127,7 +127,7 @@ s2_current_binding_beats_route() {
   mk_profile team; mk_profile other
   run_dc use other
   mkdir -p proj/sub; run_dc bind team proj
-  cd proj/sub; run_dc current
+  cd proj/sub || exit 1; run_dc current
   assert_contains "team"
   assert_contains "bound via"
 }
@@ -266,6 +266,8 @@ s7_share_projects_merges_and_links() {
   assert_contains "dotclaude keep team"
 }
 s7_share_projects_failed_merge_leaves_profile() {
+  # root reads mode-000 files, so the merge cannot be made to fail there
+  [ "$(id -u)" -ne 0 ] || { echo "    (skipped: running as root)"; return 0; }
   mk_profile team
   mkdir -p "$HOME/.claude/projects"
   local p="$DOTCLAUDE_HOME/profiles/team/projects"
@@ -454,13 +456,14 @@ s9_doctor_skips_cleanup_check_without_json_tools() {
   mk_profile team team@example.com
   mkdir -p "$HOME/.claude/projects"
   run_dc share team projects
-  # PATH with every /usr/bin tool except python3 and jq
+  # PATH with every /bin and /usr/bin tool except python3 and jq. On merged-/usr
+  # Linux /bin is /usr/bin, so /bin itself must not stay on PATH.
   mkdir -p "$SB/nojson"
   local f
-  for f in /usr/bin/*; do ln -s "$f" "$SB/nojson/$(basename "$f")" 2>/dev/null || true; done
+  for f in /bin/* /usr/bin/*; do ln -s "$f" "$SB/nojson/$(basename "$f")" 2>/dev/null || true; done
   rm -f "$SB/nojson/python3" "$SB/nojson/jq"
   local oldpath="$PATH"
-  PATH="$SB/bin:$SB/nojson:/bin"
+  PATH="$SB/bin:$SB/nojson"
   run_dc doctor
   PATH="$oldpath"
   assert_status 0

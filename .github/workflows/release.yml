@@ -1,0 +1,67 @@
+name: Release
+
+# Tag a commit on main as vX.Y.Z (matching VERSION in bin/dotclaude and a
+# CHANGELOG.md section) and push the tag. This workflow then:
+#   1. re-runs the tests,
+#   2. publishes a GitHub release with the script and SHA256SUMS
+#      (what `install.sh` downloads and verifies),
+#   3. points Formula/dotclaude.rb at the new source tarball and commits
+#      that to main (what `brew install` reads).
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag matches VERSION and CHANGELOG
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' bin/dotclaude)"
+          [ "$tag" = "$ver" ] || { echo "tag $GITHUB_REF_NAME does not match VERSION=$ver"; exit 1; }
+          grep -q "^## \[$tag\]" CHANGELOG.md || { echo "CHANGELOG.md has no section for $tag"; exit 1; }
+
+      - name: Test suite
+        run: tests/run
+
+      - name: Build release assets
+        run: |
+          mkdir -p dist
+          cp bin/dotclaude dist/dotclaude
+          (cd dist && sha256sum dotclaude > SHA256SUMS)
+          # Release notes = this version's CHANGELOG section.
+          awk -v v="${GITHUB_REF_NAME#v}" '
+            /^## \[/ { p = index($0, "[" v "]") > 0; next }
+            p' CHANGELOG.md > dist/notes.md
+          cat dist/SHA256SUMS dist/notes.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/dotclaude dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" --notes-file dist/notes.md
+
+      - name: Point the Homebrew formula at this release
+        run: |
+          url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz"
+          sha="$(curl -fsSL "$url" | sha256sum | awk '{print $1}')"
+          git checkout -B main origin/main
+          sed -i \
+            -e "s|^  url \".*\"$|  url \"$url\"|" \
+            -e "s|^  sha256 \".*\"$|  sha256 \"$sha\"|" \
+            Formula/dotclaude.rb
+          git diff --quiet Formula/dotclaude.rb && { echo "formula already current"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Formula: $GITHUB_REF_NAME" Formula/dotclaude.rb
+          git push origin HEAD:main

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Smoke test for install.sh: checkout mode, uninstall, and remote mode against
+# a local HTTP server standing in for GitHub releases (so it also proves the
+# checksum verification rejects a tampered download). Needs python3 for the
+# server; sandboxed like tests/run — never touches ~/.local/bin.
+set -u
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0; FAIL=0
+SB="$(mktemp -d "${TMPDIR:-/tmp}/dotclaude-install.XXXXXX")"
+SERVER_PID=""
+cleanup() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; rm -rf "$SB"; }
+trap cleanup EXIT
+export HOME="$SB/home"; mkdir -p "$HOME"
+export DOTCLAUDE_BIN_DIR="$SB/bin"
+unset DOTCLAUDE_VERSION DOTCLAUDE_RELEASES_URL DOTCLAUDE_RAW_URL 2>/dev/null || true
+
+ok()   { PASS=$((PASS + 1)); echo "  ✓ $1"; }
+bad()  { FAIL=$((FAIL + 1)); echo "  ✗ $1"; echo "$2" | sed 's/^/      /'; }
+check() { # name status-expected output-must-contain command...
+  local name="$1" want="$2" needle="$3"; shift 3
+  local out status
+  out="$("$@" 2>&1)"; status=$?
+  if [ "$status" -eq "$want" ] && case "$out" in *"$needle"*) true ;; *) false ;; esac; then ok "$name"
+  else bad "$name (exit $status, wanted $want; looking for '$needle')" "$out"; fi
+}
+
+echo "install.sh: checkout mode"
+check "symlinks the checkout" 0 "symlink" sh "$ROOT/install.sh"
+[ -L "$SB/bin/dotclaude" ] && ok "target is a symlink" || bad "target is a symlink" "$(ls -la "$SB/bin")"
+check "installed script runs" 0 "dotclaude " "$SB/bin/dotclaude" version
+check "uninstall removes it" 0 "Removed" sh "$ROOT/install.sh" --uninstall
+[ ! -e "$SB/bin/dotclaude" ] && ok "target gone after uninstall" || bad "target gone after uninstall" ""
+check "uninstall is idempotent" 0 "Nothing installed" sh "$ROOT/install.sh" --uninstall
+echo "#!/bin/sh" > "$SB/bin/dotclaude"
+check "uninstall refuses a foreign file" 1 "does not look like dotclaude" sh "$ROOT/install.sh" --uninstall
+rm -f "$SB/bin/dotclaude"
+check "unknown option is an error" 1 "unknown option" sh "$ROOT/install.sh" --bogus
+
+echo "install.sh: remote mode (local server stands in for GitHub)"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  - skipped: python3 not available for the fake release server"
+else
+  www="$SB/www"
+  mkdir -p "$www/latest/download" "$www/download/v9.9.9" "$www/raw/main/bin"
+  cp "$ROOT/bin/dotclaude" "$www/latest/download/dotclaude"
+  (cd "$www/latest/download" && { command -v sha256sum >/dev/null 2>&1 && sha256sum dotclaude || shasum -a 256 dotclaude; } > SHA256SUMS)
+  # a pinned version whose asset was tampered with after the checksum was taken
+  cp "$www/latest/download/SHA256SUMS" "$www/download/v9.9.9/SHA256SUMS"
+  { cat "$ROOT/bin/dotclaude"; echo "echo tampered"; } > "$www/download/v9.9.9/dotclaude"
+  cp "$ROOT/bin/dotclaude" "$www/raw/main/bin/dotclaude"
+
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+  (cd "$www" && exec python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1) &
+  SERVER_PID=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl -fs "http://127.0.0.1:$port/" >/dev/null 2>&1 && break; sleep 0.3
+  done
+  export DOTCLAUDE_RELEASES_URL="http://127.0.0.1:$port" DOTCLAUDE_RAW_URL="http://127.0.0.1:$port/raw"
+
+  # pipe through sh exactly like the documented one-liner (no $0, no checkout)
+  check "latest release: verified install" 0 "Verified SHA-256" sh -c "cat '$ROOT/install.sh' | sh"
+  [ -f "$SB/bin/dotclaude" ] && [ ! -L "$SB/bin/dotclaude" ] && ok "target is a regular file" || bad "target is a regular file" ""
+  check "installed copy runs" 0 "dotclaude " "$SB/bin/dotclaude" version
+  before="$(cat "$SB/bin/dotclaude")"
+  check "tampered asset is rejected" 1 "checksum mismatch" sh -c "cat '$ROOT/install.sh' | sh -s -- --version v9.9.9"
+  [ "$(cat "$SB/bin/dotclaude")" = "$before" ] && ok "rejected download leaves the install untouched" || bad "rejected download leaves the install untouched" ""
+  check "missing release is an error" 1 "download failed" sh -c "cat '$ROOT/install.sh' | sh -s -- --version v0.0.0"
+  check "--version main downloads the raw script" 0 "unreleased tip" sh -c "cat '$ROOT/install.sh' | sh -s -- --version main"
+  check "uninstall removes the downloaded copy" 0 "Removed" sh -c "cat '$ROOT/install.sh' | sh -s -- --uninstall"
+fi
+
+echo
+echo "passed: $PASS  failed: $FAIL"
+[ "$FAIL" -eq 0 ]

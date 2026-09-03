@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # dotclaude — manage multiple Claude Code accounts (profiles) on one machine.
+# (install.sh identifies a downloaded copy by this "# dotclaude" header line.)
 # https://github.com/ya-luotao/dotclaude
 set -euo pipefail
 
-VERSION="0.9.0"
+VERSION="0.10.0"
 DOTCLAUDE_HOME="${DOTCLAUDE_HOME:-$HOME/.dotclaude}"
 PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
 
@@ -16,6 +17,7 @@ PROFILES_DIR="$DOTCLAUDE_HOME/profiles"
 # part of the default set, because it merges session history across accounts.
 SHARE_WHITELIST="agents skills commands plugins hooks settings.json keybindings.json CLAUDE.md projects"
 SHARE_DEFAULT="agents skills commands plugins hooks settings.json keybindings.json CLAUDE.md"
+# shellcheck disable=SC2034  # documents the excluded set; SHARE_WHITELIST enforces it
 NEVER_SHARE=".credentials.json .claude.json history.jsonl todos sessions cache"
 
 err()  { printf 'dotclaude: %s\n' "$*" >&2; }
@@ -681,7 +683,7 @@ md_names() {
   local dir="$1" marker="$2" f rel depth=""
   [ -d "$dir" ] || return 0
   [ "$marker" = "SKILL.md" ] && depth="-mindepth 2 -maxdepth 2"
-  # shellcheck disable=SC2086 -- depth is a deliberate two-flag word split
+  # shellcheck disable=SC2086  # depth is a deliberate two-flag word split
   find -L "$dir" $depth -type f -name "$marker" 2>/dev/null | sort | while IFS= read -r f; do
     rel="${f#"$dir"/}"
     if [ "$marker" = "SKILL.md" ]; then rel="${rel%/SKILL.md}"; else rel="${rel%.md}"; fi

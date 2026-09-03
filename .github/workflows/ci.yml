@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test suite
+        run: tests/run
+      - name: Test suite under macOS /bin/bash 3.2
+        if: runner.os == 'macOS'
+        run: |
+          /bin/bash --version | head -n1
+          sed '1s|.*|#!/bin/bash|' bin/dotclaude > "$RUNNER_TEMP/dotclaude"
+          chmod +x "$RUNNER_TEMP/dotclaude"
+          DOTCLAUDE_TEST_BIN="$RUNNER_TEMP/dotclaude" /bin/bash tests/run
+      - name: Installer smoke test
+        run: tests/installer
+
+  lint:
+    name: shellcheck + syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning bin/dotclaude install.sh tests/run tests/installer
+      - name: POSIX sh syntax (dash) for the installer
+        run: dash -n install.sh
+      - name: Version and changelog agree
+        run: |
+          ver="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' bin/dotclaude)"
+          grep -q "^## \[$ver\]" CHANGELOG.md || { echo "CHANGELOG.md has no section for $ver"; exit 1; }

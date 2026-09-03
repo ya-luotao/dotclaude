@@ -1,12 +1,25 @@
 # dotclaude
 
-Run multiple Claude Code accounts (e.g. personal + team) on one machine, without
-them stepping on each other — plus a few chores that come with that setup.
+[![CI](https://github.com/ya-luotao/dotclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/ya-luotao/dotclaude/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ya-luotao/dotclaude?display_name=tag)](https://github.com/ya-luotao/dotclaude/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Claude Code has no built-in account switcher. Its documented isolation mechanism
-is `CLAUDE_CONFIG_DIR`: each config directory gets its own credentials, settings,
-sessions, and (on macOS) its own Keychain entry. `dotclaude` wraps that mechanism
-into profiles.
+Run multiple Claude Code accounts (personal + team, say) on one machine without
+them stepping on each other — plus the chores that come with that setup.
+
+Claude Code has no built-in account switcher. Its documented isolation
+mechanism is `CLAUDE_CONFIG_DIR`: each config directory gets its own
+credentials, settings, sessions and (on macOS) its own Keychain entry.
+dotclaude wraps that mechanism into **profiles**. It is one dependency-free
+shell script with a [behavior spec](SPEC.md) and a hermetic test suite.
+
+```sh
+dotclaude setup team          # create profile "team", log in once
+dotclaude run team            # launch claude as "team"
+dotclaude bind team           # in a repo: bare `claude` here is now "team"
+dotclaude share team          # reuse your agents, skills, settings, plugins
+dotclaude list                # who is logged in where
+```
 
 ## Disclaimer
 
@@ -19,14 +32,48 @@ and your organization's policies (e.g. don't use it to circumvent usage limits
 or seat licensing). The author accepts no responsibility for misuse or for any
 damage arising from use of this tool.
 
+## Requirements
+
+- macOS or Linux, with bash 3.2 or newer (macOS's stock `/bin/bash` is fine).
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) on your `PATH`
+  as `claude`.
+- Optional: `jq` or `python3`. They read Claude Code's JSON files for the
+  account shown by `list`, the `usage` and `keep` commands, plugin counts in
+  `items`, and `doctor`'s retention check. Without either, those degrade
+  (no account column, `usage`/`keep` refuse) and everything else works.
+- Shell integration (per-project bindings, global routing) supports zsh and
+  bash. In other shells use `dotclaude run <name>`.
+
 ## Install
 
+**Homebrew** (macOS or Linux):
+
 ```sh
-git clone https://github.com/ya-luotao/dotclaude ~/space/dotclaude
-~/space/dotclaude/install.sh
+brew tap ya-luotao/dotclaude https://github.com/ya-luotao/dotclaude
+brew install dotclaude
 ```
 
-Then add to `~/.zshrc` (pick any alias — `dc`, `dcl`, or none):
+**Installer script** — downloads the latest [release](https://github.com/ya-luotao/dotclaude/releases),
+verifies its SHA-256 against the published `SHA256SUMS`, and installs to
+`~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ya-luotao/dotclaude/main/install.sh | sh
+```
+
+Pin a version with `DOTCLAUDE_VERSION=v0.10.0` (or `... | sh -s -- --version v0.10.0`),
+change the location with `DOTCLAUDE_BIN_DIR`, and pass `--uninstall` to remove it.
+
+**From source** — the checkout is symlinked, so `git pull` updates it:
+
+```sh
+git clone https://github.com/ya-luotao/dotclaude.git
+cd dotclaude && ./install.sh
+```
+
+Whichever way you installed, add the shell integration to `~/.zshrc` (or
+`~/.bashrc`). It defines a `claude()` wrapper that applies bindings and routes,
+plus an optional short alias:
 
 ```sh
 eval "$(dotclaude shellenv --alias dc)"
@@ -34,24 +81,38 @@ eval "$(dotclaude shellenv --alias dc)"
 
 ## Concepts
 
-- **`default` profile** — your existing login. It is represented by *not* setting
-  `CLAUDE_CONFIG_DIR` at all (config lives at `~/.claude` + `~/.claude.json`).
-  Do **not** set `CLAUDE_CONFIG_DIR=~/.claude` manually: with the env var set,
-  Claude Code looks for `.claude.json` *inside* the directory, which is not where
-  the default login keeps it — you'd look logged out.
+- **`default` profile** — your existing login. It is represented by *not*
+  setting `CLAUDE_CONFIG_DIR` at all (config lives at `~/.claude` +
+  `~/.claude.json`). Do **not** set `CLAUDE_CONFIG_DIR=~/.claude` manually:
+  with the env var set, Claude Code looks for `.claude.json` *inside* the
+  directory, which is not where the default login keeps it — you'd look
+  logged out.
 - **Named profiles** — live at `~/.dotclaude/profiles/<name>`, activated by
   setting `CLAUDE_CONFIG_DIR` to that path.
 
-## Usage
+## Commands
 
-```sh
-dotclaude setup team          # create profile "team", opens claude to /login
-dotclaude list                # profiles + which account each is logged into
-dotclaude run team            # launch claude as "team" (any extra args pass through)
-dotclaude run default         # launch claude as your original login
-dotclaude use team            # route bare `claude` to "team" globally
-dotclaude current             # which profile applies right here
-```
+| Command | What it does |
+| --- | --- |
+| `setup <name>` | Create a profile and open claude in it to `/login` |
+| `run <name> [args...]` | Launch claude as a profile (`default` = your original login) |
+| `use [name\|default]` | Route bare `claude` to a profile globally; no arg shows, `default` clears |
+| `list` | Profiles with the account each is logged into |
+| `current` | Which profile applies in this directory, and why |
+| `bind <name> [dir]` / `unbind [dir]` | Per-project binding via a `.dotclaude` file |
+| `share <name> [items...]` / `unshare` | Symlink config from `~/.claude` into a profile |
+| `items [name] [--names]` | What config each profile has, and what is shared |
+| `doctor` | Common multi-account pitfalls |
+| `usage [name]` | Cached 5h / weekly rate-limit windows per profile |
+| `du` | Disk usage per profile |
+| `clean <name> [--days N] [--force]` | Delete old session transcripts (dry-run by default) |
+| `keep <name> [--days N]` | Stop Claude Code from auto-deleting a profile's sessions |
+| `shellenv [--alias NAME]` | Print the shell integration |
+| `help [command]` | Help, per command too (`dotclaude <command> --help`) |
+
+`dotclaude help <command>` has the details and examples for each.
+
+## Usage
 
 ### Global routing
 
@@ -78,10 +139,10 @@ Binding works through the `claude()` shell wrapper from `shellenv`: it walks up
 from `$PWD` looking for a `.dotclaude` file. An explicitly set
 `CLAUDE_CONFIG_DIR` always wins over a binding.
 
-> **Limitation:** anything that invokes the `claude` *binary* directly — scripts,
-> herdr panes, CI, other tools — bypasses the shell function and gets the default
-> account. For those, use `dotclaude run <name>` or set `CLAUDE_CONFIG_DIR`
-> explicitly.
+> **Limitation:** anything that invokes the `claude` *binary* directly —
+> scripts, editor integrations, CI, other tools — bypasses the shell function
+> and gets the default account. For those, use `dotclaude run <name>` or set
+> `CLAUDE_CONFIG_DIR` explicitly.
 
 ### Sharing config between profiles
 
@@ -163,7 +224,7 @@ dotclaude unshare team projects   # restore pre-share transcripts; transcripts
 ```
 
 Afterwards every sharing profile sees and resumes the same sessions
-(`--resume`/`--continue`), project memory included. Two things to know:
+(`--resume`/`--continue`), project memory included. Three things to know:
 
 - **Set a retention horizon on every participating profile**
   (`dotclaude keep <name>`, default profile included) — otherwise one
@@ -223,23 +284,49 @@ to that key regardless of which profile you launch.
 macOS Keychain (appears to be keyed per config dir — run the verification
 above once to confirm on your machine), falling back to
 `<profile>/.credentials.json` (mode 0600, plaintext) when the Keychain is
-unavailable (SSH, containers).
+unavailable (Linux, SSH, containers).
+
+**How do I keep per-profile settings while sharing `settings.json`?**
+Put them in the profile's `settings.local.json` — it is never shared and
+Claude Code layers it over `settings.json`.
+
+## Update and uninstall
+
+| Installed via | Update | Uninstall |
+| --- | --- | --- |
+| Homebrew | `brew upgrade dotclaude` | `brew uninstall dotclaude` |
+| Installer script | re-run the `curl ... \| sh` line | `curl ... \| sh -s -- --uninstall` |
+| Source checkout | `git pull` | `./install.sh --uninstall` |
+
+Uninstalling removes only the command. Profiles, logins and sessions stay in
+`~/.dotclaude`; delete that directory if you want them gone, and drop the
+`shellenv` line from your shell rc.
 
 ## Development
 
-Behavior promises live in [SPEC.md](SPEC.md); the test suite enforces them:
+Behavior promises live in [SPEC.md](SPEC.md); `tests/run` enforces them and
+`tests/installer` covers `install.sh`. Every test runs in a hermetic sandbox (fresh `HOME`, fake `claude` binary,
+minimal `PATH`), so it never touches your real login or sessions.
 
 ```sh
-tests/run
+tests/run          # behavior suite
+tests/installer    # install.sh: checkout mode, uninstall, verified download
+shellcheck -S warning bin/dotclaude install.sh tests/run tests/installer
 ```
 
-Zero dependencies — each test runs in a hermetic sandbox (fresh `HOME`,
-fake `claude` binary, minimal `PATH`), so it never touches your real login
-or sessions.
+CI runs the same on macOS (including stock `/bin/bash` 3.2) and Ubuntu.
 
-## Uninstall
+**Releasing.** Bump `VERSION` in `bin/dotclaude`, add a `## [x.y.z]` section
+to [CHANGELOG.md](CHANGELOG.md), commit, then tag and push:
 
 ```sh
-rm ~/.local/bin/dotclaude
-# per-profile data stays in ~/.dotclaude/profiles — delete manually if wanted
+git tag -a v0.10.0 -m "v0.10.0" && git push origin main v0.10.0
 ```
+
+The release workflow re-runs the tests, publishes a GitHub release (the script
+plus `SHA256SUMS`, which the installer verifies), and commits the updated
+`Formula/dotclaude.rb` so Homebrew users get the new version.
+
+## License
+
+[MIT](LICENSE).
